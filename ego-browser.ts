@@ -1,0 +1,286 @@
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { getWebSearchConfigPath } from "./utils.ts";
+
+const WEB_SEARCH_CONFIG_PATH = getWebSearchConfigPath();
+const RESULT_PREFIX = "__PI_WEB_ACCESS_EGO_RESULT__";
+const DEFAULT_TIMEOUT_MS = 45_000;
+const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
+const DEFAULT_DOMAINS = [
+	"x.com",
+	"twitter.com",
+	"pixiv.net",
+	"instagram.com",
+	"facebook.com",
+	"threads.net",
+	"weibo.com",
+	"mp.weixin.qq.com",
+	"feishu.cn",
+	"larksuite.com",
+];
+
+export interface EgoBrowserConfig {
+	enabled: boolean;
+	firstPartyDomains: string[];
+	timeoutMs: number;
+	spacePrefix: string;
+}
+
+export interface EgoBrowserPageData {
+	url: string;
+	title: string;
+	text: string;
+	snapshot: string;
+	links: string[];
+	images: string[];
+	videos: string[];
+	taskSpaceId?: string | number;
+}
+
+export interface EgoBrowserFetchResult {
+	page: EgoBrowserPageData;
+	spaceName: string;
+}
+
+const spaceLocks = new Map<string, Promise<void>>();
+const activeSpaces = new Set<string>();
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function loadRootConfig(): Record<string, unknown> {
+	if (!existsSync(WEB_SEARCH_CONFIG_PATH)) return {};
+	let value: unknown;
+	try {
+		value = JSON.parse(readFileSync(WEB_SEARCH_CONFIG_PATH, "utf8"));
+	} catch (error) {
+		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${errorMessage(error)}`);
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error(`Invalid config in ${WEB_SEARCH_CONFIG_PATH}: expected a JSON object`);
+	}
+	return value as Record<string, unknown>;
+}
+
+function normalizeDomain(value: string): string {
+	return value.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/+$/, "");
+}
+
+function normalizeDomains(value: unknown): string[] {
+	if (!Array.isArray(value)) return DEFAULT_DOMAINS;
+	const domains = value
+		.filter((entry): entry is string => typeof entry === "string")
+		.map(normalizeDomain)
+		.filter(Boolean);
+	if (domains.length === 0) throw new Error(`egoBrowser.firstPartyDomains in ${WEB_SEARCH_CONFIG_PATH} must contain at least one hostname`);
+	return [...new Set(domains)];
+}
+
+function normalizeTimeout(value: unknown): number {
+	if (value === undefined) return DEFAULT_TIMEOUT_MS;
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 5_000) {
+		throw new Error(`egoBrowser.timeoutMs in ${WEB_SEARCH_CONFIG_PATH} must be a number >= 5000`);
+	}
+	return Math.min(Math.floor(value), 180_000);
+}
+
+export function loadEgoBrowserConfig(): EgoBrowserConfig {
+	const root = loadRootConfig();
+	const raw = root.egoBrowser;
+	if (raw === undefined) {
+		return {
+			enabled: true,
+			firstPartyDomains: DEFAULT_DOMAINS,
+			timeoutMs: DEFAULT_TIMEOUT_MS,
+			spacePrefix: "pi-web-access",
+		};
+	}
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+		throw new Error(`egoBrowser in ${WEB_SEARCH_CONFIG_PATH} must be an object`);
+	}
+	const config = raw as Record<string, unknown>;
+	if (config.enabled !== undefined && typeof config.enabled !== "boolean") {
+		throw new Error(`egoBrowser.enabled in ${WEB_SEARCH_CONFIG_PATH} must be a boolean`);
+	}
+	const prefix = typeof config.spacePrefix === "string" && config.spacePrefix.trim()
+		? config.spacePrefix.trim()
+		: "pi-web-access";
+	return {
+		enabled: config.enabled !== false,
+		firstPartyDomains: normalizeDomains(config.firstPartyDomains),
+		timeoutMs: normalizeTimeout(config.timeoutMs),
+		spacePrefix: prefix,
+	};
+}
+
+function hostMatches(hostname: string, domain: string): boolean {
+	return hostname === domain || hostname.endsWith(`.${domain}`);
+}
+
+export function shouldUseEgoBrowser(url: string, options: { mode?: string; authFetchProfile?: unknown } = {}): boolean {
+	if (options.mode === "raw" || options.authFetchProfile) return false;
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return false;
+	}
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+	const config = loadEgoBrowserConfig();
+	return config.enabled && config.firstPartyDomains.some((domain) => hostMatches(parsed.hostname.toLowerCase(), domain));
+}
+
+function safePart(value: string): string {
+	return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50) || "page";
+}
+
+function buildSpaceName(url: string, config: EgoBrowserConfig, sessionId?: string): string {
+	const parsed = new URL(url);
+	const sessionPart = sessionId ? safePart(sessionId.slice(0, 24)) : "session";
+	return `${config.spacePrefix}-${sessionPart}-${safePart(parsed.hostname)}`;
+}
+
+function buildScript(url: string, spaceName: string, timeoutMs: number): string {
+	const timeoutSeconds = Math.max(5, Math.ceil(timeoutMs / 1000));
+	return `
+const task = await useOrCreateTaskSpace(${JSON.stringify(spaceName)})
+await openOrReuseTab(${JSON.stringify(url)}, { wait: true, timeout: ${timeoutSeconds} })
+const info = await pageInfo()
+const snapshot = await snapshotText()
+let dom = {}
+try {
+  dom = await js(String.raw\`(() => ({
+    text: document.body?.innerText || '',
+    links: [...document.querySelectorAll('a[href]')].map((el) => el.href).filter(Boolean).slice(0, 200),
+    images: [...document.querySelectorAll('img[src]')].map((el) => el.src).filter(Boolean).slice(0, 100),
+    videos: [...document.querySelectorAll('video, video source')].map((el) => el.currentSrc || el.src).filter(Boolean).slice(0, 100),
+  }))()\`)
+} catch (error) {
+  dom = { error: String(error) }
+}
+cliLog(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({
+  taskSpaceId: task.id,
+  url: info?.url || ${JSON.stringify(url)},
+  title: info?.title || '',
+  snapshot: typeof snapshot === 'string' ? snapshot : '',
+  text: typeof dom?.text === 'string' ? dom.text : '',
+  links: Array.isArray(dom?.links) ? dom.links : [],
+  images: Array.isArray(dom?.images) ? dom.images : [],
+  videos: Array.isArray(dom?.videos) ? dom.videos : [],
+}))
+`;
+}
+
+function appendOutput(target: { value: string }, chunk: Buffer | string): void {
+	target.value += chunk.toString();
+	if (Buffer.byteLength(target.value, "utf8") > MAX_OUTPUT_BYTES) {
+		throw new Error("Ego Browser output exceeded the safety limit");
+	}
+}
+
+async function runEgoScript(script: string, timeoutMs: number, signal?: AbortSignal): Promise<EgoBrowserPageData> {
+	if (signal?.aborted) throw new Error("Aborted");
+	const command = process.env.PI_EGO_BROWSER_BIN || "ego-browser";
+	const child = spawn(command, ["nodejs"], {
+		stdio: ["pipe", "pipe", "pipe"],
+		env: { ...process.env },
+	});
+	let stdout = { value: "" };
+	let stderr = { value: "" };
+	let settled = false;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const abort = () => child.kill("SIGTERM");
+
+	return await new Promise<EgoBrowserPageData>((resolve, reject) => {
+		const finish = (error?: Error, result?: EgoBrowserPageData) => {
+			if (settled) return;
+			settled = true;
+			if (timer) clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+			if (error) reject(error);
+			else if (result) resolve(result);
+			else reject(new Error("Ego Browser returned no result"));
+		};
+
+		child.on("error", (error) => finish(error));
+		child.stdout.on("data", (chunk) => {
+			try { appendOutput(stdout, chunk); } catch (error) { child.kill("SIGTERM"); finish(new Error(errorMessage(error))); }
+		});
+		child.stderr.on("data", (chunk) => {
+			try { appendOutput(stderr, chunk); } catch (error) { child.kill("SIGTERM"); finish(new Error(errorMessage(error))); }
+		});
+		child.on("close", (code, closeSignal) => {
+			const combinedOutput = `${stdout.value}\n${stderr.value}`;
+			const markerIndex = combinedOutput.lastIndexOf(RESULT_PREFIX);
+			const line = markerIndex >= 0
+				? combinedOutput.slice(markerIndex + RESULT_PREFIX.length).split(/\r?\n/, 1)[0].trim()
+				: null;
+			if (line) {
+				try {
+					const parsed = JSON.parse(line) as EgoBrowserPageData;
+					finish(undefined, parsed);
+					return;
+				} catch (error) {
+					finish(new Error(`Invalid Ego Browser result: ${errorMessage(error)}`));
+					return;
+				}
+			}
+			const detail = stderr.value.trim() || stdout.value.trim() || `exit=${code ?? "unknown"}${closeSignal ? ` signal=${closeSignal}` : ""}`;
+			finish(new Error(`Ego Browser failed: ${detail.slice(-2000)}`));
+		});
+		timer = setTimeout(() => {
+			child.kill("SIGTERM");
+			finish(new Error(`Ego Browser timed out after ${timeoutMs}ms`));
+		}, timeoutMs);
+		signal?.addEventListener("abort", abort, { once: true });
+		child.stdin.end(script);
+	});
+}
+
+async function withSpaceLock<T>(spaceName: string, task: () => Promise<T>): Promise<T> {
+	const previous = spaceLocks.get(spaceName) ?? Promise.resolve();
+	let release!: () => void;
+	const current = new Promise<void>((resolve) => { release = resolve; });
+	spaceLocks.set(spaceName, current);
+	await previous;
+	try {
+		return await task();
+	} finally {
+		release();
+		if (spaceLocks.get(spaceName) === current) spaceLocks.delete(spaceName);
+	}
+}
+
+export async function fetchWithEgoBrowser(
+	url: string,
+	signal?: AbortSignal,
+	options?: { sessionId?: string },
+): Promise<EgoBrowserFetchResult> {
+	const config = loadEgoBrowserConfig();
+	const spaceName = buildSpaceName(url, config, options?.sessionId);
+	activeSpaces.add(spaceName);
+	return withSpaceLock(spaceName, async () => {
+		const page = await runEgoScript(buildScript(url, spaceName, config.timeoutMs), config.timeoutMs, signal);
+		const text = (page.text || page.snapshot || "").trim();
+		if (!text) throw new Error("Ego Browser opened the page but exposed no readable content");
+		return { page: { ...page, text }, spaceName };
+	});
+}
+
+export async function closeEgoBrowserSpaces(): Promise<void> {
+	const spaces = [...activeSpaces];
+	activeSpaces.clear();
+	if (spaces.length === 0) return;
+	const script = `
+for (const name of ${JSON.stringify(spaces)}) {
+  try { await completeTaskSpace(name, { keep: false }) } catch {}
+}
+cliLog(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({ closed: ${spaces.length} }))
+`;
+	try {
+		await runEgoScript(script, 15_000);
+	} catch {
+		// Session shutdown must not fail just because the browser is unavailable.
+	}
+}

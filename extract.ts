@@ -28,6 +28,7 @@ import { isImageEnabled } from "./feature-config.ts";
 import { assertAuthFetchUrl, authFetchRedirectGuard, type AuthFetchProfile } from "./auth-fetch.ts";
 import { getBrowserCookiesForHosts, getLastBrowserCookieDiagnostic } from "./chrome-cookies.ts";
 import { sanitizeInlineDataUris } from "./data-uri-sanitize.ts";
+import { fetchWithEgoBrowser, shouldUseEgoBrowser } from "./ego-browser.ts";
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const CONCURRENT_LIMIT = 3;
@@ -208,6 +209,8 @@ export interface ExtractedContent {
 	title: string;
 	content: string;
 	error: string | null;
+	source?: "http" | "ego-browser" | "provider";
+	taskSpaceId?: string | number;
 	thumbnail?: { data: string; mimeType: string };
 	frames?: VideoFrame[];
 	duration?: number;
@@ -227,6 +230,7 @@ export interface ExtractOptions {
 	mode?: "readable" | "raw" | "answer";
 	answerModel?: string;
 	authFetchProfile?: AuthFetchProfile;
+	sessionId?: string;
 	/** Custom DNS resolver used for SSRF validation. Primarily a test seam. */
 	lookup?: Lookup;
 }
@@ -624,6 +628,36 @@ export async function extractContent(
 
 	if (signal?.aborted) return abortedResult(url);
 
+	let egoBrowserError: string | null = null;
+	try {
+		if (shouldUseEgoBrowser(url, options)) {
+			try {
+				const egoResult = await fetchWithEgoBrowser(url, signal, { sessionId: options?.sessionId });
+				const page = egoResult.page;
+				const media = [
+					...page.images.map((image) => `- Image: ${image}`),
+					...page.videos.map((video) => `- Video: ${video}`),
+				];
+				const links = page.links.length > 0 ? `\n\n## Links\n${page.links.map((link) => `- ${link}`).join("\n")}` : "";
+				const mediaText = media.length > 0 ? `\n\n## Media\n${media.join("\n")}` : "";
+				return {
+					url: page.url || url,
+					title: page.title || extractTextTitle(page.text, url),
+					content: `${page.text}${mediaText}${links}`,
+					error: null,
+					source: "ego-browser",
+					taskSpaceId: page.taskSpaceId,
+				};
+			} catch (err) {
+				if (isAbortError(err)) return abortedResult(url);
+				egoBrowserError = errorMessage(err);
+			}
+		}
+	} catch (err) {
+		if (isConfigParseError(err)) return { url, title: "", content: "", error: errorMessage(err) };
+		egoBrowserError = errorMessage(err);
+	}
+
 	let fetchRouting: FetchRouting;
 	try {
 		fetchRouting = loadFetchRouting();
@@ -858,6 +892,7 @@ export async function extractContent(
 
 	const guidance = [
 		finalHttpResult?.error ?? "No fetch_content provider returned content",
+		...(egoBrowserError ? [`Ego Browser attempt failed: ${egoBrowserError}`] : []),
 		...(firecrawlError ? [`Firecrawl fallback failed: ${firecrawlError}`] : []),
 		...(tinyfishError ? [`TinyFish fallback failed: ${tinyfishError}`] : []),
 		...(search1apiError ? [`Search1API fallback failed: ${search1apiError}`] : []),
@@ -879,7 +914,7 @@ export async function extractContent(
 		`  • Set brightdataApiKey and brightdataUnlockerZone in ${WEB_SEARCH_CONFIG_PATH} or BRIGHTDATA_API_KEY and BRIGHTDATA_UNLOCKER_ZONE`,
 		`  • Set GEMINI_API_KEY in ${WEB_SEARCH_CONFIG_PATH}`,
 		"  • Sign into gemini.google.com in Chrome",
-		"  • Use web_search to find content about this topic",
+		"  • This was a direct URL fetch; do not replace it with keyword search unless the user explicitly requested web research",
 	].join("\n");
 	return { ...(finalHttpResult ?? { url, title: "", content: "", error: null }), error: guidance };
 }

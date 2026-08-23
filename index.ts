@@ -68,6 +68,7 @@ import { isSerpBaseAvailable } from "./serpbase.ts";
 import { isSerperAvailable } from "./serper.ts";
 import { isValyuAvailable } from "./valyu.ts";
 import { buildSearchErrorPlan, type SearchErrorDetails, type SearchErrorPlan } from "./render-search-error.ts";
+import { closeEgoBrowserSpaces } from "./ego-browser.ts";
 import { findModelWithProviderRouting, loadEnabledModelPatterns, modelMatchesEnabledPatterns, splitThinkingSuffix } from "./summary-model-scope.ts";
 import {
 	buildResearchArtifact,
@@ -560,6 +561,7 @@ function resolveProvider(
 
 const pendingFetches = new Map<string, AbortController>();
 let sessionActive = false;
+let activeSessionId: string | undefined;
 let widgetVisible = false;
 let widgetUnsubscribe: (() => void) | null = null;
 const pendingCurates = new Map<string, PendingCurate>();
@@ -964,6 +966,7 @@ function handleSessionChange(ctx: ExtensionContext): void {
 	closeCurator();
 	clearCloneCache();
 	sessionActive = true;
+	activeSessionId = ctx.sessionManager.getSessionId();
 	restoreFromSession(ctx);
 	// Unsubscribe before clear() to avoid callback with stale ctx
 	widgetUnsubscribe?.();
@@ -997,12 +1000,12 @@ export default function (pi: ExtensionAPI) {
 	const curateKey = initConfig.shortcuts?.curate || DEFAULT_SHORTCUTS.curate;
 	const activityKey = initConfig.shortcuts?.activity || DEFAULT_SHORTCUTS.activity;
 
-	function startBackgroundFetch(urls: string[]): string | null {
+	function startBackgroundFetch(urls: string[], sessionId?: string): string | null {
 		if (urls.length === 0) return null;
 		const fetchId = generateId();
 		const controller = new AbortController();
 		pendingFetches.set(fetchId, controller);
-		fetchAllContent(urls, controller.signal)
+		fetchAllContent(urls, controller.signal, sessionId ? { sessionId } : undefined)
 			.then((fetched) => {
 				if (!sessionActive || !pendingFetches.has(fetchId)) return;
 				const data = {
@@ -1319,7 +1322,7 @@ export default function (pi: ExtensionAPI) {
 				output += `---\nFull content for ${opts.inlineContent.length} sources available [${fetchId}].`;
 			}
 		} else if (opts.includeContent) {
-			fetchId = startBackgroundFetch(opts.urls);
+			fetchId = startBackgroundFetch(opts.urls, activeSessionId);
 			if (fetchId && !hasApprovedSummary) {
 				output += `---\nContent fetching in background [${fetchId}]. Will notify when ready.`;
 			}
@@ -1657,9 +1660,11 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => handleSessionChange(ctx));
 	pi.on("session_tree", async (_event, ctx) => handleSessionChange(ctx));
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
 		sessionActive = false;
+		activeSessionId = undefined;
 		abortPendingFetches();
+		await closeEgoBrowserSpaces();
 		closeCurator();
 		clearCloneCache();
 		clearResults();
@@ -2306,7 +2311,8 @@ export default function (pi: ExtensionAPI) {
 			if (params.fetchContent && results.length > 0) {
 				const urls = results.slice(0, 5).map((result) => result.url);
 				try {
-					fetched = await fetchAllContent(urls, signal);
+					const sessionId = ctx?.sessionManager?.getSessionId?.();
+					fetched = await fetchAllContent(urls, signal, sessionId ? { sessionId } : undefined);
 				} catch (err) {
 					if (signal?.aborted || isAbortError(err)) throw err;
 					fetched = urls.map((url) => ({ url, title: "", content: "", error: err instanceof Error ? err.message : String(err) }));
@@ -2339,9 +2345,9 @@ export default function (pi: ExtensionAPI) {
 	if (fetchContentEnabled) pi.registerTool({
 		name: toolNames.fetchContent,
 		label: "Fetch Content",
-		description: `Fetch URL(s) and extract readable content as markdown. Use mode "raw" for exact textual HTTP response bodies or mode "answer" with prompt to answer using only fetched content. Direct image URLs return resized image content. Supports YouTube transcripts, GitHub repositories, PDFs, and local videos. ${fetchContentStorageNote}`,
+		description: `Fetch URL(s) and extract readable content as markdown. Dynamic or login-aware sites such as X, Pixiv, Instagram, Feishu, and Weibo use an isolated Ego Browser Space before static fetch fallbacks. Use mode "raw" for exact textual HTTP response bodies or mode "answer" with prompt to answer using only fetched content. Direct image URLs return resized image content. Supports YouTube transcripts, GitHub repositories, PDFs, and local videos. ${fetchContentStorageNote}`,
 		promptSnippet:
-			"Use to fetch readable or raw URL content, direct images, GitHub repos, and videos. Mode answer answers a prompt using only the fetched source.",
+			"Use for a known URL. Dynamic/login-aware pages use an isolated Ego Browser Space; do not switch to keyword search just because direct fetching is blocked.",
 		parameters: Type.Object({
 			url: Type.Optional(Type.String({ description: "Single URL to fetch" })),
 			urls: Type.Optional(Type.Array(Type.String(), { description: "Multiple URLs (parallel)" })),
@@ -2423,9 +2429,10 @@ export default function (pi: ExtensionAPI) {
 			const fetchOptions = mode === "answer"
 				? (() => {
 					const { prompt: _prompt, ...rest } = extractionOptions;
-					return { ...rest, ...(authFetchProfile ? { authFetchProfile } : {}) };
+					const sessionId = ctx?.sessionManager?.getSessionId?.();
+					return { ...rest, ...(sessionId ? { sessionId } : {}), ...(authFetchProfile ? { authFetchProfile } : {}) };
 				})()
-				: { ...extractionOptions, ...(authFetchProfile ? { authFetchProfile } : {}) };
+				: { ...extractionOptions, ...(ctx?.sessionManager?.getSessionId?.() ? { sessionId: ctx.sessionManager.getSessionId() } : {}), ...(authFetchProfile ? { authFetchProfile } : {}) };
 			const fetchResults = await fetchAllContent(urlList, signal, fetchOptions);
 			const presentedResults = mode === "answer"
 				? await Promise.all(fetchResults.map(async result => {
@@ -2502,6 +2509,8 @@ export default function (pi: ExtensionAPI) {
 						successful: 1,
 						totalChars: fullLength,
 						title: result.title,
+						source: result.source,
+						taskSpaceId: result.taskSpaceId,
 						...(storedContent ? { responseId } : {}),
 						truncated,
 						hasImage: imageCount > 0,

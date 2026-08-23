@@ -28,6 +28,12 @@
 pi install npm:pi-web-access
 ```
 
+The Ego Browser fork can be installed directly from GitHub while it is being maintained:
+
+```bash
+pi install git+https://github.com/cookingios/pi-web-access.git
+```
+
 Works immediately with no API keys — Exa MCP provides zero-config search. If Pi has Codex auth from `/login`, OpenAI search can also work without a separate key. For more providers or direct API access, add keys to `~/.pi/web-search.json`:
 
 ```json
@@ -45,6 +51,29 @@ Works immediately with no API keys — Exa MCP provides zero-config search. If P
   "geminiApiKey": "AIza..."
 }
 ```
+
+### Ego Browser Spaces
+
+When `ego-browser` is installed, known dynamic or login-aware domains are opened in an isolated Ego Browser Space before static HTTP fallbacks. The browser route uses the `ego-browser nodejs` helper API only; it does not use CDP, `agent-browser`, or a localhost debugging proxy. The same Pi session and hostname reuse the same Space, and session shutdown closes Spaces created by the extension.
+
+```json
+{
+  "egoBrowser": {
+    "enabled": true,
+    "firstPartyDomains": [
+      "x.com",
+      "twitter.com",
+      "pixiv.net",
+      "instagram.com",
+      "feishu.cn"
+    ],
+    "timeoutMs": 45000,
+    "spacePrefix": "pi-web-access"
+  }
+}
+```
+
+The built-in domain list is used when `firstPartyDomains` is omitted. Set `enabled` to `false` to retain the original HTTP-only behavior. `fetch_content` keeps raw mode and explicit `auth` fetches on their original routes.
 
 In `auto` mode (default), `web_search` tries a configured SearXNG endpoint first for local/private search. When the active Pi model is `openai-codex`, it then tries Codex-backed OpenAI search. Otherwise it tries Exa (direct API if keyed, MCP if not) before OpenAI, then Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Jina, SERPdive, Perplexity, Gemini API, and Gemini Web when browser-cookie access is enabled. Exa handles search; curator summary drafts are generated separately by the configured Pi summary model, defaulting to Claude Haiku, Codex Luna, Codex Terra, Gemini 3.6 Flash, GPT-5 mini, then DeepSeek V4 Flash when available. Slow summary drafts fall back to a deterministic result summary after a bounded deadline.
 
@@ -856,6 +885,7 @@ Rate limits: Perplexity is capped at 10 requests/minute (client-side). Jina Sear
 | `duckduckgo.ts` | Explicit-only keyless DuckDuckGo HTML search provider |
 | `exa.ts` | Exa.ai search provider — direct API and MCP proxy |
 | `extract.ts` | URL/file path routing, HTTP extraction, fallback orchestration |
+| `ego-browser.ts` | Isolated Ego Browser Space runner and dynamic-page routing |
 | `content-find.ts` | Bounded exact, case-insensitive, and fuzzy passage lookup |
 | `page-query.ts` | Grounded page-local answer generation with model context budgeting |
 | `gemini-search.ts` | Single-provider, ordered-fallback, and simultaneous all-provider search aggregation |

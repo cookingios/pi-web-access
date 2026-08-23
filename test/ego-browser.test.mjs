@@ -1,0 +1,54 @@
+import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { test } from "node:test";
+
+const extractUrl = new URL("../extract.ts", import.meta.url).href;
+
+test("dynamic first-party URLs use Ego Browser before HTTP fetch", () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-ego-browser-"));
+	const fakeEgo = join(root, "fake-ego-browser");
+	const payload = JSON.stringify({
+		taskSpaceId: "42",
+		url: "https://x.com/example/status/1",
+		title: "Example post",
+		snapshot: "",
+		text: "This content came from the isolated Ego Browser Space.",
+		links: ["https://x.com/example/status/1"],
+		images: ["https://pbs.twimg.com/example.jpg"],
+		videos: [],
+	});
+	writeFileSync(fakeEgo, `#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '__PI_WEB_ACCESS_EGO_RESULT__${payload}'\n`, "utf8");
+	chmodSync(fakeEgo, 0o755);
+	writeFileSync(join(root, "web-search.json"), JSON.stringify({
+		egoBrowser: { enabled: true, firstPartyDomains: ["x.com"] },
+	}) + "\n", "utf8");
+
+	const child = spawnSync(process.execPath, ["--input-type=module"], {
+		input: `
+globalThis.fetch = async () => { throw new Error("HTTP should not run before Ego Browser"); };
+const { extractContent } = await import(${JSON.stringify(extractUrl)});
+const result = await extractContent("https://x.com/example/status/1", undefined, { sessionId: "session-123" });
+console.log(JSON.stringify(result));
+`,
+		encoding: "utf8",
+		env: {
+			...process.env,
+			PI_CODING_AGENT_DIR: root,
+			HOME: root,
+			USERPROFILE: root,
+			PI_EGO_BROWSER_BIN: fakeEgo,
+		},
+		maxBuffer: 2 * 1024 * 1024,
+	});
+
+	assert.equal(child.status, 0, child.stderr);
+	const result = JSON.parse(child.stdout.trim());
+	assert.equal(result.error, null);
+	assert.equal(result.source, "ego-browser");
+	assert.equal(result.taskSpaceId, "42");
+	assert.match(result.content, /isolated Ego Browser Space/);
+	assert.match(result.content, /pbs\.twimg\.com\/example\.jpg/);
+});
