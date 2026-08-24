@@ -69,6 +69,7 @@ import { isSerperAvailable } from "./serper.ts";
 import { isValyuAvailable } from "./valyu.ts";
 import { buildSearchErrorPlan, type SearchErrorDetails, type SearchErrorPlan } from "./render-search-error.ts";
 import { closeEgoBrowserSpaces, fetchMediaWithEgoBrowser } from "./ego-browser.ts";
+import { persistMediaToTemp } from "./media-temp.ts";
 import { findModelWithProviderRouting, loadEnabledModelPatterns, modelMatchesEnabledPatterns, splitThinkingSuffix } from "./summary-model-scope.ts";
 import {
 	buildResearchArtifact,
@@ -2741,8 +2742,8 @@ export default function (pi: ExtensionAPI) {
 	if (fetchMediaEnabled) pi.registerTool({
 		name: toolNames.fetchMedia,
 		label: "Fetch Media",
-		description: "Retrieve image bytes from media URLs exposed by fetch_content, using the same authenticated Ego Browser Space as the source page. Pass sourceUrl for media hosted on a CDN or a different origin. Returns the fetched image to the model when the site permits browser access; it reports CDN errors instead of presenting a screenshot as the original file.",
-		promptSnippet: "Use after fetch_content returns a Media URL when the user wants to inspect or preserve the actual image. Pass the Media item's source page as sourceUrl, especially when the asset is on a CDN. Prefer this over opening the image in a tab and taking a screenshot.",
+		description: "Retrieve image bytes from media URLs exposed by fetch_content, using the same authenticated Ego Browser Space as the source page. Saves a local intermediate copy under ~/Desktop/Temp/pi-web-access/<session>/ and returns an image block only to models that advertise image input; text-only models receive the local path for vision-bridge processing. Pass sourceUrl for media hosted on a CDN or a different origin.",
+		promptSnippet: "Use after fetch_content returns a Media URL when the user wants to inspect or preserve the actual image. Pass the Media item's source page as sourceUrl, especially when the asset is on a CDN. Prefer this over opening the image in a tab, taking a screenshot, or using shell curl.",
 		parameters: Type.Object({
 			url: Type.Optional(Type.String({ description: "One image URL from fetch_content's Media section" })),
 			urls: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 8, description: "Image URLs from fetch_content's Media section" })),
@@ -2770,7 +2771,8 @@ export default function (pi: ExtensionAPI) {
 						...(sessionId ? { sessionId } : {}),
 						...(typeof params.sourceUrl === "string" && params.sourceUrl.trim() ? { sourceUrl: params.sourceUrl.trim() } : {}),
 					});
-					return { url, media };
+					const localPath = await persistMediaToTemp(media, { sessionId });
+					return { url, media, localPath };
 				} catch (error) {
 					return { url, error: error instanceof Error ? error.message : String(error) };
 				}
@@ -2778,20 +2780,29 @@ export default function (pi: ExtensionAPI) {
 			if (signal?.aborted) return { content: [{ type: "text", text: "Aborted" }], details: { error: "Aborted" } };
 
 			const content: Array<TextContent | ImageContent> = [];
+			const modelInput = ctx?.model?.input;
+			const modelSupportsImages = modelInput === undefined ? true : String(modelInput).includes("image");
 			const mediaDetails: Array<Record<string, unknown>> = [];
 			for (const item of results) {
-				if (item.error || !item.media) {
+				if (item.error || !item.media || !item.localPath) {
 					content.push({ type: "text", text: `Failed: ${item.url}\n${item.error || "Unknown media error"}` });
 					mediaDetails.push({ url: item.url, error: item.error || "Unknown media error" });
 					continue;
 				}
-				content.push({ type: "image", data: item.media.data, mimeType: item.media.mimeType });
-				content.push({ type: "text", text: `Image bytes retrieved: ${item.media.url} (${item.media.bytes} bytes; ${item.media.mimeType}; browser-page-fetch, not screenshot)` });
+				if (modelSupportsImages) {
+					content.push({ type: "image", data: item.media.data, mimeType: item.media.mimeType });
+				}
+				content.push({
+					type: "text",
+					text: `Image bytes retrieved: ${item.media.url} (${item.media.bytes} bytes; ${item.media.mimeType}; browser-page-fetch, not screenshot)\nLocal file: ${item.localPath}${modelSupportsImages ? "" : "\nCurrent model does not advertise image input; use this local file with a vision bridge or another image-capable tool."}`,
+				});
 				mediaDetails.push({
 					requestedUrl: item.url,
 					url: item.media.url,
 					mimeType: item.media.mimeType,
 					bytes: item.media.bytes,
+					localPath: item.localPath,
+					modelSupportsImages,
 					retrievalMethod: "ego-browser-page-fetch",
 					isOriginal: true,
 				});

@@ -188,7 +188,7 @@ fetch_content({ url: "https://example.com/diagram.png" })
 fetch_content({ url: "https://x.com/user/status/123", mediaMode: "inline" })
 ```
 
-When a dynamic page returns a `## Media` section, use `fetch_media` for image inspection and pass the source page URL. It reuses that page's logged-in Ego Browser context, works across CDN/media origins, normalizes X images to `name=orig`, and returns the original image bytes directly to the model when the site's media origin permits browser fetching. Some sites, including Pixiv, may expose an image in the page while rejecting a separate binary request with HTTP 403; the tool reports that limitation instead of substituting a screenshot.
+When a dynamic page returns a `## Media` section, use `fetch_media` for image inspection and pass the source page URL. It reuses that page's logged-in Ego Browser context, works across CDN/media origins, normalizes X images to `name=orig`, saves an intermediate copy under `~/Desktop/Temp/pi-web-access/<session>/`, and returns the original image bytes directly only when the current model advertises image input. Text-only models receive the local path so a vision bridge can process it without a shell `curl` request. Some sites, including Pixiv, may expose an image in the page while rejecting a separate binary request with HTTP 403; the tool reports that limitation instead of substituting a screenshot.
 
 ```typescript
 fetch_media({ url: "https://cdn.example.com/assets/example.jpg", sourceUrl: "https://example.com/post/123" })
