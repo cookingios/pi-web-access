@@ -23,6 +23,7 @@ const DEFAULT_DOMAINS = [
 	"reddit.com",
 	"xiaohongshu.com",
 	"xueqiu.com",
+	"articles.zsxq.com",
 ];
 const DEFAULT_MEDIA_DOMAINS = [
 	"pbs.twimg.com",
@@ -35,6 +36,7 @@ const DEFAULT_MEDIA_DOMAINS = [
 	"xqimg.imedao.com",
 	"sinaimg.cn",
 	"weibocdn.com",
+	"article-images.zsxq.com",
 ];
 
 export interface EgoBrowserConfig {
@@ -245,20 +247,24 @@ try {
     const isXiaohongshu = hostname === 'xiaohongshu.com' || hostname.endsWith('.xiaohongshu.com')
     const isXueqiu = hostname === 'xueqiu.com' || hostname.endsWith('.xueqiu.com')
     const isWeibo = hostname === 'weibo.com' || hostname.endsWith('.weibo.com')
+    const isZsxq = hostname === 'articles.zsxq.com'
     const xueqiuArticle = isXueqiu
       ? document.querySelector('article.article__bd, .article__bd')
       : null
     const weiboPost = isWeibo
       ? document.querySelector('article, [class*="_detail_"]')
       : null
-    const article = !isPixiv && !isReddit && !isXiaohongshu && !isXueqiu && !isWeibo
+    const zsxqPost = isZsxq
+      ? document.querySelector('.post.js_watermark.quill-editor, .post.quill-editor, .quill-editor')
+      : null
+    const article = !isPixiv && !isReddit && !isXiaohongshu && !isXueqiu && !isWeibo && !isZsxq
       ? [...document.querySelectorAll('article[data-testid="tweet"], article')].find((el) => el.querySelector('time')) || null
       : null
     const redditPost = isReddit
       ? document.querySelector('shreddit-post, [data-testid="post-container"], article')
       : null
-    const scope = xueqiuArticle || article || redditPost || weiboPost || document
-    const scopedToPost = Boolean(xueqiuArticle || article || redditPost || weiboPost)
+    const scope = xueqiuArticle || article || redditPost || weiboPost || zsxqPost || document
+    const scopedToPost = Boolean(xueqiuArticle || article || redditPost || weiboPost || zsxqPost)
     const unique = (values) => [...new Set(values.filter(Boolean))]
     const hostMatchesUrl = (src, domain) => {
       try {
@@ -310,6 +316,12 @@ try {
           .filter((src) => !/\\/avatar|\\/crop\\.|\\/upload\\/|\\/expression\\/|\\/face\\./i.test(src))
         return unique(candidates.map(normalizeUrl))
       }
+      if (isZsxq) {
+        const candidates = [...scope.querySelectorAll('img[src]')]
+          .map((el) => el.currentSrc || el.src)
+          .filter((src) => hostMatchesUrl(src, 'article-images.zsxq.com'))
+        return unique(candidates.map(normalizeUrl))
+      }
       return unique([...scope.querySelectorAll('img[src]')]
         .map((el) => el.currentSrc || el.src)
         .filter(Boolean)
@@ -324,6 +336,7 @@ try {
       if (isReddit) return unique(candidates.filter((src) => hostMatchesUrl(src, 'redd.it') || hostMatchesUrl(src, 'redditmedia.com')))
       if (isXueqiu) return unique(candidates.filter((src) => hostMatchesUrl(src, 'imedao.com')))
       if (isWeibo) return unique(candidates.filter((src) => hostMatchesUrl(src, 'weibocdn.com') || hostMatchesUrl(src, 'sinaimg.cn')))
+      if (isZsxq) return unique(candidates)
       return unique(candidates)
     })()
     const sourceUrl = location.href
@@ -332,7 +345,7 @@ try {
       ...videoUrls.map((url) => ({ kind: 'video', url, source: scopedToPost ? 'article' : 'page', sourceUrl })),
     ]
     return {
-    text: ((isXueqiu || isWeibo) ? (scope?.innerText || document.body?.innerText || '') : document.body?.innerText || ''),
+    text: ((isXueqiu || isWeibo || isZsxq) ? (scope?.innerText || document.body?.innerText || '') : document.body?.innerText || ''),
     links: [...document.querySelectorAll('a[href]')].map((el) => el.href).filter(Boolean).slice(0, 200),
     images: [...new Set(imageUrls)].slice(0, 100),
     videos: [...new Set(videoUrls)].slice(0, 100),

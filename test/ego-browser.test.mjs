@@ -53,7 +53,7 @@ console.log(JSON.stringify(result));
 	assert.match(result.content, /pbs\.twimg\.com\/example\.jpg/);
 });
 
-test("built-in dynamic domains include Pixiv, Reddit, Xiaohongshu, Xueqiu, and Weibo", () => {
+test("built-in dynamic domains include Pixiv, Reddit, Xiaohongshu, Xueqiu, Weibo, and Zhishixingqiu", () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-ego-default-domains-"));
 	const child = spawnSync(process.execPath, ["--input-type=module"], {
 		input: `
@@ -64,6 +64,7 @@ const pages = [
   shouldUseEgoBrowser("https://www.xiaohongshu.com/explore/abc"),
   shouldUseEgoBrowser("https://xueqiu.com/4641860462/406244638"),
   shouldUseEgoBrowser("https://weibo.com/2634877355/ReQqI8KaY"),
+  shouldUseEgoBrowser("https://articles.zsxq.com/id_example.html"),
 ];
 const media = [
   shouldUseEgoBrowserMedia("https://i.pximg.net/img-master/example.jpg"),
@@ -72,6 +73,7 @@ const media = [
   shouldUseEgoBrowserMedia("https://xqimg.imedao.com/example.jpg"),
   shouldUseEgoBrowserMedia("https://wx2.sinaimg.cn/large/example.jpg"),
   shouldUseEgoBrowserMedia("https://f.video.weibocdn.com/example.mp4"),
+  shouldUseEgoBrowserMedia("https://article-images.zsxq.com/example.jpg"),
 ];
 console.log(JSON.stringify({ pages, media }));
 `,
@@ -87,8 +89,8 @@ console.log(JSON.stringify({ pages, media }));
 
 	assert.equal(child.status, 0, child.stderr);
 	assert.deepEqual(JSON.parse(child.stdout.trim()), {
-		pages: [true, true, true, true, true],
-		media: [true, true, true, true, true, true],
+        pages: [true, true, true, true, true, true],
+        media: [true, true, true, true, true, true, true],
 	});
 });
 

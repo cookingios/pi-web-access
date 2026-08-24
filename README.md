@@ -68,6 +68,7 @@ When `ego-browser` is installed, known dynamic or login-aware domains are opened
       "xiaohongshu.com",
       "xueqiu.com",
       "weibo.com",
+      "articles.zsxq.com",
       "instagram.com",
       "feishu.cn"
     ],
@@ -81,7 +82,8 @@ When `ego-browser` is installed, known dynamic or login-aware domains are opened
       "xhscdn.com",
       "xqimg.imedao.com",
       "sinaimg.cn",
-      "weibocdn.com"
+      "weibocdn.com",
+      "article-images.zsxq.com"
     ],
     "timeoutMs": 45000,
     "spacePrefix": "pi-web-access"
