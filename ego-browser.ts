@@ -1,11 +1,14 @@
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { getWebSearchConfigPath } from "./utils.ts";
+import { loadFetchContentDomainPolicy, loadSsrfConfig, validateRemoteUrl } from "./ssrf-protection.ts";
 
 const WEB_SEARCH_CONFIG_PATH = getWebSearchConfigPath();
 const RESULT_PREFIX = "__PI_WEB_ACCESS_EGO_RESULT__";
 const DEFAULT_TIMEOUT_MS = 45_000;
-const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
+const MAX_PAGE_OUTPUT_BYTES = 8 * 1024 * 1024;
+const MAX_MEDIA_OUTPUT_BYTES = 32 * 1024 * 1024;
+const MAX_MEDIA_BYTES = 24 * 1024 * 1024;
 const DEFAULT_DOMAINS = [
 	"x.com",
 	"twitter.com",
@@ -18,12 +21,29 @@ const DEFAULT_DOMAINS = [
 	"feishu.cn",
 	"larksuite.com",
 ];
+const DEFAULT_MEDIA_DOMAINS = ["pbs.twimg.com", "video.twimg.com"];
 
 export interface EgoBrowserConfig {
 	enabled: boolean;
 	firstPartyDomains: string[];
+	mediaDomains: string[];
 	timeoutMs: number;
 	spacePrefix: string;
+}
+
+export interface EgoBrowserMedia {
+	kind: "image" | "video";
+	url: string;
+	source: "article" | "page";
+	sourceUrl?: string;
+}
+
+export interface EgoBrowserMediaData {
+	url: string;
+	mimeType: string;
+	bytes: number;
+	data: string;
+	taskSpaceId?: string | number;
 }
 
 export interface EgoBrowserPageData {
@@ -34,6 +54,7 @@ export interface EgoBrowserPageData {
 	links: string[];
 	images: string[];
 	videos: string[];
+	media?: EgoBrowserMedia[];
 	taskSpaceId?: string | number;
 }
 
@@ -77,6 +98,16 @@ function normalizeDomains(value: unknown): string[] {
 	return [...new Set(domains)];
 }
 
+function normalizeOptionalDomains(value: unknown, fallback: string[]): string[] {
+	if (!Array.isArray(value)) return fallback;
+	const domains = value
+		.filter((entry): entry is string => typeof entry === "string")
+		.map(normalizeDomain)
+		.filter(Boolean);
+	if (domains.length === 0) throw new Error(`egoBrowser.mediaDomains in ${WEB_SEARCH_CONFIG_PATH} must contain at least one hostname`);
+	return [...new Set(domains)];
+}
+
 function normalizeTimeout(value: unknown): number {
 	if (value === undefined) return DEFAULT_TIMEOUT_MS;
 	if (typeof value !== "number" || !Number.isFinite(value) || value < 5_000) {
@@ -92,6 +123,7 @@ export function loadEgoBrowserConfig(): EgoBrowserConfig {
 		return {
 			enabled: true,
 			firstPartyDomains: DEFAULT_DOMAINS,
+			mediaDomains: DEFAULT_MEDIA_DOMAINS,
 			timeoutMs: DEFAULT_TIMEOUT_MS,
 			spacePrefix: "pi-web-access",
 		};
@@ -109,6 +141,7 @@ export function loadEgoBrowserConfig(): EgoBrowserConfig {
 	return {
 		enabled: config.enabled !== false,
 		firstPartyDomains: normalizeDomains(config.firstPartyDomains),
+		mediaDomains: normalizeOptionalDomains(config.mediaDomains, DEFAULT_MEDIA_DOMAINS),
 		timeoutMs: normalizeTimeout(config.timeoutMs),
 		spacePrefix: prefix,
 	};
@@ -131,6 +164,45 @@ export function shouldUseEgoBrowser(url: string, options: { mode?: string; authF
 	return config.enabled && config.firstPartyDomains.some((domain) => hostMatches(parsed.hostname.toLowerCase(), domain));
 }
 
+export function shouldUseEgoBrowserMedia(url: string, options: { sourceUrl?: string } = {}): boolean {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return false;
+	}
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+	const config = loadEgoBrowserConfig();
+	if (!config.enabled) return false;
+	if (config.mediaDomains.some((domain) => hostMatches(parsed.hostname.toLowerCase(), domain))) return true;
+	if (!options.sourceUrl) return false;
+	return shouldUseEgoBrowser(options.sourceUrl);
+}
+
+function normalizeMediaUrl(value: string): string {
+	try {
+		const parsed = new URL(value);
+		if (parsed.hostname.toLowerCase() === "pbs.twimg.com" && parsed.pathname.startsWith("/media/")) {
+			parsed.searchParams.set("name", "orig");
+		}
+		return parsed.toString();
+	} catch {
+		return value;
+	}
+}
+
+async function validateBrowserMediaUrls(url: string, sourceUrl?: string): Promise<void> {
+	const ssrf = loadSsrfConfig();
+	const domainPolicy = loadFetchContentDomainPolicy();
+	const options = {
+		allowRanges: ssrf.allowRanges,
+		trustEnvProxy: ssrf.trustEnvProxy,
+		domainPolicy,
+	};
+	await validateRemoteUrl(url, options);
+	if (sourceUrl) await validateRemoteUrl(sourceUrl, options);
+}
+
 function safePart(value: string): string {
 	return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50) || "page";
 }
@@ -146,16 +218,43 @@ function buildScript(url: string, spaceName: string, timeoutMs: number): string 
 	return `
 const task = await useOrCreateTaskSpace(${JSON.stringify(spaceName)})
 await openOrReuseTab(${JSON.stringify(url)}, { wait: true, timeout: ${timeoutSeconds} })
+await wait(2)
 const info = await pageInfo()
 const snapshot = await snapshotText()
 let dom = {}
 try {
-  dom = await js(String.raw\`(() => ({
+  dom = await js(String.raw\`(() => {
+    const article = [...document.querySelectorAll('article[data-testid="tweet"], article')]
+      .find((el) => el.querySelector('time')) || null
+    const scope = article || document
+    const isX = location.hostname === 'x.com' || location.hostname.endsWith('.x.com') || location.hostname === 'twitter.com' || location.hostname.endsWith('.twitter.com')
+    const imageUrls = [...scope.querySelectorAll('img[src]')]
+      .map((el) => el.src)
+      .filter(Boolean)
+      .filter((src) => !isX || /pbs\\.twimg\\.com\\/media\\//.test(src))
+      .map((src) => {
+        try {
+          const parsed = new URL(src)
+          if (parsed.hostname === 'pbs.twimg.com' && parsed.pathname.startsWith('/media/')) parsed.searchParams.set('name', 'orig')
+          return parsed.toString()
+        } catch { return src }
+      })
+    const videoUrls = [...scope.querySelectorAll('video, video source')]
+      .map((el) => el.currentSrc || el.src)
+      .filter(Boolean)
+    const sourceUrl = location.href
+    const media = [
+      ...imageUrls.map((url) => ({ kind: 'image', url, source: article ? 'article' : 'page', sourceUrl })),
+      ...videoUrls.map((url) => ({ kind: 'video', url, source: article ? 'article' : 'page', sourceUrl })),
+    ]
+    return {
     text: document.body?.innerText || '',
     links: [...document.querySelectorAll('a[href]')].map((el) => el.href).filter(Boolean).slice(0, 200),
-    images: [...document.querySelectorAll('img[src]')].map((el) => el.src).filter(Boolean).slice(0, 100),
-    videos: [...document.querySelectorAll('video, video source')].map((el) => el.currentSrc || el.src).filter(Boolean).slice(0, 100),
-  }))()\`)
+    images: [...new Set(imageUrls)].slice(0, 100),
+    videos: [...new Set(videoUrls)].slice(0, 100),
+    media: media.slice(0, 100),
+    }
+  })()\`)
 } catch (error) {
   dom = { error: String(error) }
 }
@@ -168,18 +267,46 @@ cliLog(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({
   links: Array.isArray(dom?.links) ? dom.links : [],
   images: Array.isArray(dom?.images) ? dom.images : [],
   videos: Array.isArray(dom?.videos) ? dom.videos : [],
+  media: Array.isArray(dom?.media) ? dom.media : [],
 }))
 `;
 }
 
-function appendOutput(target: { value: string }, chunk: Buffer | string): void {
+function buildMediaScript(url: string, spaceName: string, timeoutMs: number, maxBytes: number, sourceUrl?: string): string {
+	const timeoutSeconds = Math.max(5, Math.ceil(timeoutMs / 1000));
+	return `
+const task = await useOrCreateTaskSpace(${JSON.stringify(spaceName)})
+${sourceUrl ? `await openOrReuseTab(${JSON.stringify(sourceUrl)}, { wait: true, timeout: ${timeoutSeconds} })` : ""}
+await openOrReuseTab(${JSON.stringify(url)}, { wait: true, timeout: ${timeoutSeconds} })
+const result = await js(String.raw\`(async () => {
+  const target = ${JSON.stringify(normalizeMediaUrl(url))}
+  const response = await fetch(target, { credentials: 'include', cache: 'force-cache' })
+  if (!response.ok) throw new Error('Media request failed: HTTP ' + response.status)
+  const contentType = (response.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase()
+  if (!contentType.startsWith('image/')) throw new Error('Expected an image response, received ' + (contentType || 'unknown content type'))
+  const bytes = new Uint8Array(await response.arrayBuffer())
+  if (bytes.byteLength > ${maxBytes}) throw new Error('Media exceeds the ${Math.round(maxBytes / 1024 / 1024)}MB safety limit')
+  let binary = ''
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+  return {
+    url: response.url || target,
+    mimeType: contentType,
+    bytes: bytes.byteLength,
+    data: btoa(binary),
+  }
+})()\`)
+cliLog(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({ taskSpaceId: task.id, ...result }))
+`;
+}
+
+function appendOutput(target: { value: string }, chunk: Buffer | string, maxBytes: number): void {
 	target.value += chunk.toString();
-	if (Buffer.byteLength(target.value, "utf8") > MAX_OUTPUT_BYTES) {
+	if (Buffer.byteLength(target.value, "utf8") > maxBytes) {
 		throw new Error("Ego Browser output exceeded the safety limit");
 	}
 }
 
-async function runEgoScript(script: string, timeoutMs: number, signal?: AbortSignal): Promise<EgoBrowserPageData> {
+async function runEgoScript<T>(script: string, timeoutMs: number, signal?: AbortSignal, maxOutputBytes = MAX_PAGE_OUTPUT_BYTES): Promise<T> {
 	if (signal?.aborted) throw new Error("Aborted");
 	const command = process.env.PI_EGO_BROWSER_BIN || "ego-browser";
 	const child = spawn(command, ["nodejs"], {
@@ -192,8 +319,8 @@ async function runEgoScript(script: string, timeoutMs: number, signal?: AbortSig
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const abort = () => child.kill("SIGTERM");
 
-	return await new Promise<EgoBrowserPageData>((resolve, reject) => {
-		const finish = (error?: Error, result?: EgoBrowserPageData) => {
+	return await new Promise<T>((resolve, reject) => {
+		const finish = (error?: Error, result?: T) => {
 			if (settled) return;
 			settled = true;
 			if (timer) clearTimeout(timer);
@@ -205,10 +332,10 @@ async function runEgoScript(script: string, timeoutMs: number, signal?: AbortSig
 
 		child.on("error", (error) => finish(error));
 		child.stdout.on("data", (chunk) => {
-			try { appendOutput(stdout, chunk); } catch (error) { child.kill("SIGTERM"); finish(new Error(errorMessage(error))); }
+			try { appendOutput(stdout, chunk, maxOutputBytes); } catch (error) { child.kill("SIGTERM"); finish(new Error(errorMessage(error))); }
 		});
 		child.stderr.on("data", (chunk) => {
-			try { appendOutput(stderr, chunk); } catch (error) { child.kill("SIGTERM"); finish(new Error(errorMessage(error))); }
+			try { appendOutput(stderr, chunk, maxOutputBytes); } catch (error) { child.kill("SIGTERM"); finish(new Error(errorMessage(error))); }
 		});
 		child.on("close", (code, closeSignal) => {
 			const combinedOutput = `${stdout.value}\n${stderr.value}`;
@@ -218,7 +345,7 @@ async function runEgoScript(script: string, timeoutMs: number, signal?: AbortSig
 				: null;
 			if (line) {
 				try {
-					const parsed = JSON.parse(line) as EgoBrowserPageData;
+					const parsed = JSON.parse(line) as T;
 					finish(undefined, parsed);
 					return;
 				} catch (error) {
@@ -261,11 +388,34 @@ export async function fetchWithEgoBrowser(
 	const spaceName = buildSpaceName(url, config, options?.sessionId);
 	activeSpaces.add(spaceName);
 	return withSpaceLock(spaceName, async () => {
-		const page = await runEgoScript(buildScript(url, spaceName, config.timeoutMs), config.timeoutMs, signal);
+		const page = await runEgoScript<EgoBrowserPageData>(buildScript(url, spaceName, config.timeoutMs), config.timeoutMs, signal);
 		const text = (page.text || page.snapshot || "").trim();
 		if (!text) throw new Error("Ego Browser opened the page but exposed no readable content");
 		return { page: { ...page, text }, spaceName };
 	});
+}
+
+export async function fetchMediaWithEgoBrowser(
+	url: string,
+	signal?: AbortSignal,
+	options?: { sessionId?: string; sourceUrl?: string },
+): Promise<EgoBrowserMediaData> {
+	if (!shouldUseEgoBrowserMedia(url, options?.sourceUrl ? { sourceUrl: options.sourceUrl } : undefined)) {
+		let host = "the requested host";
+		try { host = new URL(url).hostname; } catch {}
+		throw new Error(`Ego Browser media fetching is not enabled for ${host}`);
+	}
+	const config = loadEgoBrowserConfig();
+	const normalizedUrl = normalizeMediaUrl(url);
+	await validateBrowserMediaUrls(normalizedUrl, options?.sourceUrl);
+	const spaceName = buildSpaceName(options?.sourceUrl || normalizedUrl, config, options?.sessionId);
+	activeSpaces.add(spaceName);
+	return withSpaceLock(spaceName, async () => runEgoScript<EgoBrowserMediaData>(
+		buildMediaScript(normalizedUrl, spaceName, config.timeoutMs, MAX_MEDIA_BYTES, options?.sourceUrl),
+		config.timeoutMs,
+		signal,
+		MAX_MEDIA_OUTPUT_BYTES,
+	));
 }
 
 export async function closeEgoBrowserSpaces(): Promise<void> {

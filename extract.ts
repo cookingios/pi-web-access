@@ -28,7 +28,7 @@ import { isImageEnabled } from "./feature-config.ts";
 import { assertAuthFetchUrl, authFetchRedirectGuard, type AuthFetchProfile } from "./auth-fetch.ts";
 import { getBrowserCookiesForHosts, getLastBrowserCookieDiagnostic } from "./chrome-cookies.ts";
 import { sanitizeInlineDataUris } from "./data-uri-sanitize.ts";
-import { fetchWithEgoBrowser, shouldUseEgoBrowser } from "./ego-browser.ts";
+import { fetchWithEgoBrowser, shouldUseEgoBrowser, type EgoBrowserMedia } from "./ego-browser.ts";
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const CONCURRENT_LIMIT = 3;
@@ -211,6 +211,7 @@ export interface ExtractedContent {
 	error: string | null;
 	source?: "http" | "ego-browser" | "provider";
 	taskSpaceId?: string | number;
+	media?: EgoBrowserMedia[];
 	thumbnail?: { data: string; mimeType: string };
 	frames?: VideoFrame[];
 	duration?: number;
@@ -634,12 +635,13 @@ export async function extractContent(
 			try {
 				const egoResult = await fetchWithEgoBrowser(url, signal, { sessionId: options?.sessionId });
 				const page = egoResult.page;
-				const media = [
-					...page.images.map((image) => `- Image: ${image}`),
-					...page.videos.map((video) => `- Video: ${video}`),
+				const media = page.media ?? [
+					...page.images.map((image): EgoBrowserMedia => ({ kind: "image", url: image, source: "page", sourceUrl: page.url || url })),
+					...page.videos.map((video): EgoBrowserMedia => ({ kind: "video", url: video, source: "page", sourceUrl: page.url || url })),
 				];
+				const mediaLines = media.map((asset, index) => `- ${asset.kind === "image" ? "Image" : "Video"} ${index + 1} (${asset.source}; source page: ${asset.sourceUrl || page.url || url}; original bytes available via fetch_media): ${asset.url}`);
 				const links = page.links.length > 0 ? `\n\n## Links\n${page.links.map((link) => `- ${link}`).join("\n")}` : "";
-				const mediaText = media.length > 0 ? `\n\n## Media\n${media.join("\n")}` : "";
+				const mediaText = media.length > 0 ? `\n\n## Media\n${mediaLines.join("\n")}` : "";
 				return {
 					url: page.url || url,
 					title: page.title || extractTextTitle(page.text, url),
@@ -647,6 +649,7 @@ export async function extractContent(
 					error: null,
 					source: "ego-browser",
 					taskSpaceId: page.taskSpaceId,
+					...(media.length > 0 ? { media } : {}),
 				};
 			} catch (err) {
 				if (isAbortError(err)) return abortedResult(url);

@@ -76,6 +76,12 @@ test("fetch_content params validate fetch and answer modes", () => {
 	assert.throws(() => normalizeFetchContentParams({ mode: "invalid" }), /mode must be/);
 });
 
+test("fetch_content params validate media mode", () => {
+	assert.equal(normalizeFetchContentParams({ mediaMode: "inline" }).options.mediaMode, "inline");
+	assert.equal(normalizeFetchContentParams({ mediaMode: "links" }).options.mediaMode, "links");
+	assert.throws(() => normalizeFetchContentParams({ mediaMode: "download" }), /mediaMode must be/);
+});
+
 
 test("fetch_content params validate auth profile input", () => {
 	assert.equal(normalizeFetchContentParams({ auth: true }).options.auth, true);

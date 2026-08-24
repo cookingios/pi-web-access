@@ -52,3 +52,47 @@ console.log(JSON.stringify(result));
 	assert.match(result.content, /isolated Ego Browser Space/);
 	assert.match(result.content, /pbs\.twimg\.com\/example\.jpg/);
 });
+
+test("configured media hosts return original image bytes through Ego Browser", () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-ego-media-"));
+	const fakeEgo = join(root, "fake-ego-browser");
+	const payload = JSON.stringify({
+		taskSpaceId: "43",
+		url: "https://example.com/assets/example.jpg",
+		mimeType: "image/jpeg",
+		bytes: 4,
+		data: "/9j/AA==",
+	});
+	writeFileSync(fakeEgo, `#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '__PI_WEB_ACCESS_EGO_RESULT__${payload}'\n`, "utf8");
+	chmodSync(fakeEgo, 0o755);
+	writeFileSync(join(root, "web-search.json"), JSON.stringify({
+		egoBrowser: { enabled: true, firstPartyDomains: ["example.com"], mediaDomains: ["pbs.twimg.com"] },
+	}) + "\n", "utf8");
+
+	const child = spawnSync(process.execPath, ["--input-type=module"], {
+		input: `
+const { fetchMediaWithEgoBrowser, shouldUseEgoBrowserMedia } = await import(${JSON.stringify(new URL("../ego-browser.ts", import.meta.url).href)});
+	const url = "https://example.com/assets/example.jpg";
+	const sourceUrl = "https://example.com/post/1";
+if (!shouldUseEgoBrowserMedia(url, { sourceUrl })) throw new Error("source-page media host was not enabled");
+const result = await fetchMediaWithEgoBrowser(url, undefined, { sessionId: "session-123", sourceUrl });
+console.log(JSON.stringify(result));
+`,
+		encoding: "utf8",
+		env: {
+			...process.env,
+			PI_CODING_AGENT_DIR: root,
+			HOME: root,
+			USERPROFILE: root,
+			PI_EGO_BROWSER_BIN: fakeEgo,
+		},
+		maxBuffer: 2 * 1024 * 1024,
+	});
+
+	assert.equal(child.status, 0, child.stderr);
+	const result = JSON.parse(child.stdout.trim());
+	assert.equal(result.taskSpaceId, "43");
+	assert.equal(result.mimeType, "image/jpeg");
+	assert.equal(result.bytes, 4);
+	assert.equal(result.data, "/9j/AA==");
+});

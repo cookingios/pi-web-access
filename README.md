@@ -67,13 +67,19 @@ When `ego-browser` is installed, known dynamic or login-aware domains are opened
       "instagram.com",
       "feishu.cn"
     ],
+    "mediaDomains": [
+      "pbs.twimg.com",
+      "video.twimg.com"
+    ],
     "timeoutMs": 45000,
     "spacePrefix": "pi-web-access"
   }
 }
 ```
 
-The built-in domain list is used when `firstPartyDomains` is omitted. Set `enabled` to `false` to retain the original HTTP-only behavior. `fetch_content` keeps raw mode and explicit `auth` fetches on their original routes.
+The built-in domain list is used when `firstPartyDomains` is omitted. `mediaDomains` is a direct-link fallback for browser-hosted media URLs. For media discovered from a dynamic source page, pass that page as `sourceUrl` to `fetch_media`; any CDN/media origin can then reuse the source page's Ego Browser Space. It defaults to X's image/video hosts for direct media links. Set `enabled` to `false` to retain the original HTTP-only behavior. `fetch_content` keeps raw mode and explicit `auth` fetches on their original routes.
+
+`toolNames.fetchMedia` can be customized alongside the existing public tool names; its default is `fetch_media`.
 
 In `auto` mode (default), `web_search` tries a configured SearXNG endpoint first for local/private search. When the active Pi model is `openai-codex`, it then tries Codex-backed OpenAI search. Otherwise it tries Exa (direct API if keyed, MCP if not) before OpenAI, then Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Jina, SERPdive, Perplexity, Gemini API, and Gemini Web when browser-cookie access is enabled. Exa handles search; curator summary drafts are generated separately by the configured Pi summary model, defaulting to Claude Haiku, Codex Luna, Codex Terra, Gemini 3.6 Flash, GPT-5 mini, then DeepSeek V4 Flash when available. Slow summary drafts fall back to a deterministic result summary after a bounded deadline.
 
@@ -165,6 +171,14 @@ fetch_content({ url: "https://example.com/api", mode: "raw" })
 fetch_content({ url: "https://example.com/guide", mode: "answer", prompt: "What are the installation steps?" })
 fetch_content({ url: "https://example.com/account", auth: "work", mode: "raw" })
 fetch_content({ url: "https://example.com/diagram.png" })
+fetch_content({ url: "https://x.com/user/status/123", mediaMode: "inline" })
+```
+
+When a dynamic page returns a `## Media` section, use `fetch_media` for image inspection and pass the source page URL. It reuses that page's logged-in Ego Browser context, works across CDN/media origins, normalizes X images to `name=orig`, and returns the original image bytes directly to the model. It does not treat a screenshot as the original file.
+
+```typescript
+fetch_media({ url: "https://cdn.example.com/assets/example.jpg", sourceUrl: "https://example.com/post/123" })
+fetch_media({ urls: ["https://cdn.example.com/one.jpg", "https://cdn.example.com/two.jpg"], sourceUrl: "https://example.com/post/123" })
 ```
 
 | Parameter | Description |
@@ -173,6 +187,7 @@ fetch_content({ url: "https://example.com/diagram.png" })
 | `prompt` | Question for video analysis, or the page-local question required by `mode: "answer"` |
 | `mode` | `readable` (default), `raw` for exact textual HTTP bodies, or `answer` for a grounded answer from fetched content |
 | `answerModel` | Optional `provider/model-id` override for answer mode; defaults to the current enabled Pi model |
+| `mediaMode` | `links` (default) lists media URLs; `inline` retrieves discovered original images through the source page's Ego Browser Space |
 | `timestamp` | Extract frame(s) — single (`"23:41"`), range (`"23:41-25:00"`), or seconds (`"85"`) |
 | `frames` | Number of frames to extract (max 12) |
 | `forceClone` | Clone GitHub repos that exceed the 350MB size threshold |

@@ -68,7 +68,7 @@ import { isSerpBaseAvailable } from "./serpbase.ts";
 import { isSerperAvailable } from "./serper.ts";
 import { isValyuAvailable } from "./valyu.ts";
 import { buildSearchErrorPlan, type SearchErrorDetails, type SearchErrorPlan } from "./render-search-error.ts";
-import { closeEgoBrowserSpaces } from "./ego-browser.ts";
+import { closeEgoBrowserSpaces, fetchMediaWithEgoBrowser } from "./ego-browser.ts";
 import { findModelWithProviderRouting, loadEnabledModelPatterns, modelMatchesEnabledPatterns, splitThinkingSuffix } from "./summary-model-scope.ts";
 import {
 	buildResearchArtifact,
@@ -229,6 +229,7 @@ type ToolNames = {
 	webSearch: string;
 	sourceCheck: string;
 	fetchContent: string;
+	fetchMedia: string;
 	getSearchContent: string;
 };
 
@@ -236,6 +237,7 @@ const DEFAULT_TOOL_NAMES: ToolNames = {
 	webSearch: "web_search",
 	sourceCheck: "source_check",
 	fetchContent: "fetch_content",
+	fetchMedia: "fetch_media",
 	getSearchContent: "get_search_content",
 };
 const TOOL_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
@@ -985,6 +987,7 @@ export default function (pi: ExtensionAPI) {
 	const webSearchEnabled = isToolEnabled(initConfig, "webSearch");
 	const sourceCheckEnabled = isToolEnabled(initConfig, "sourceCheck");
 	const fetchContentEnabled = isToolEnabled(initConfig, "fetchContent");
+	const fetchMediaEnabled = isToolEnabled(initConfig, "fetchMedia");
 	const getSearchContentEnabled = isToolEnabled(initConfig, "getSearchContent");
 	const storedContentSources = joinToolNames([
 		...(webSearchEnabled ? [toolNames.webSearch] : []),
@@ -2345,9 +2348,9 @@ export default function (pi: ExtensionAPI) {
 	if (fetchContentEnabled) pi.registerTool({
 		name: toolNames.fetchContent,
 		label: "Fetch Content",
-		description: `Fetch URL(s) and extract readable content as markdown. Dynamic or login-aware sites such as X, Pixiv, Instagram, Feishu, and Weibo use an isolated Ego Browser Space before static fetch fallbacks. Use mode "raw" for exact textual HTTP response bodies or mode "answer" with prompt to answer using only fetched content. Direct image URLs return resized image content. Supports YouTube transcripts, GitHub repositories, PDFs, and local videos. ${fetchContentStorageNote}`,
+		description: `Fetch URL(s) and extract readable content as markdown. Dynamic or login-aware sites such as X, Pixiv, Instagram, Feishu, and Weibo use an isolated Ego Browser Space before static fetch fallbacks. Use mode "raw" for exact textual HTTP response bodies or mode "answer" with prompt to answer using only fetched content. Direct image URLs return resized image content. Use mediaMode "inline" when the user needs to inspect images attached to a dynamic page; it retrieves original image bytes through the browser session instead of opening the image and taking a screenshot. Use fetch_media for an explicit follow-up or retry. Supports YouTube transcripts, GitHub repositories, PDFs, and local videos. ${fetchContentStorageNote}`,
 		promptSnippet:
-			"Use for a known URL. Dynamic/login-aware pages use an isolated Ego Browser Space; do not switch to keyword search just because direct fetching is blocked.",
+			"Use for a known URL. Dynamic/login-aware pages use an isolated Ego Browser Space; do not switch to keyword search just because direct fetching is blocked. When the user needs to inspect an attachment, set mediaMode to inline or call fetch_media on the returned Media URL; do not use a screenshot as the original file.",
 		parameters: Type.Object({
 			url: Type.Optional(Type.String({ description: "Single URL to fetch" })),
 			urls: Type.Optional(Type.Array(Type.String(), { description: "Multiple URLs (parallel)" })),
@@ -2377,6 +2380,9 @@ export default function (pi: ExtensionAPI) {
 			auth: Type.Optional(Type.Union([Type.String(), Type.Boolean()], {
 				description: "Opt into an authFetch profile for local browser-cookie fetching. Use a profile name, or true only when exactly one profile exists.",
 			})),
+			mediaMode: Type.Optional(StringEnum(["links", "inline"], {
+				description: "Dynamic-page media handling: links (default) lists discovered media URLs; inline retrieves original image bytes through the same Ego Browser Space for model inspection.",
+			})),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<Record<string, unknown>>> {
@@ -2392,8 +2398,8 @@ export default function (pi: ExtensionAPI) {
 			if (mode === "answer" && !options.prompt) {
 				return { content: [{ type: "text", text: "Error: mode answer requires prompt." }], details: { error: "mode answer requires prompt" } };
 			}
-			if (mode === "raw" && (options.forceClone === true || options.timestamp || options.frames || options.prompt || options.model || options.answerModel)) {
-				return { content: [{ type: "text", text: "Error: mode raw cannot be combined with forceClone, prompt, timestamp, frames, model, or answerModel." }], details: { error: "Incompatible raw mode options" } };
+			if (mode === "raw" && (options.forceClone === true || options.timestamp || options.frames || options.prompt || options.model || options.answerModel || options.mediaMode)) {
+				return { content: [{ type: "text", text: "Error: mode raw cannot be combined with forceClone, prompt, timestamp, frames, model, answerModel, or mediaMode." }], details: { error: "Incompatible raw mode options" } };
 			}
 			if (mode !== "answer" && options.answerModel) {
 				return { content: [{ type: "text", text: "Error: answerModel requires mode answer." }], details: { error: "answerModel requires mode answer" } };
@@ -2403,6 +2409,9 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (mode === "answer" && options.auth !== undefined) {
 				return { content: [{ type: "text", text: "Error: auth cannot be combined with mode answer." }], details: { error: "auth cannot be combined with mode answer" } };
+			}
+			if (mode === "answer" && options.mediaMode === "inline") {
+				return { content: [{ type: "text", text: "Error: mediaMode inline cannot be combined with mode answer." }], details: { error: "mediaMode inline is incompatible with mode answer" } };
 			}
 			let authFetchProfile: AuthFetchProfile | undefined;
 			if (options.auth !== undefined) {
@@ -2425,7 +2434,7 @@ export default function (pi: ExtensionAPI) {
 				details: { phase: "fetch", progress: 0 },
 			});
 
-			const { answerModel: _answerModel, auth: _auth, ...extractionOptions } = options;
+			const { answerModel: _answerModel, auth: _auth, mediaMode: _mediaMode, ...extractionOptions } = options;
 			const fetchOptions = mode === "answer"
 				? (() => {
 					const { prompt: _prompt, ...rest } = extractionOptions;
@@ -2434,6 +2443,23 @@ export default function (pi: ExtensionAPI) {
 				})()
 				: { ...extractionOptions, ...(ctx?.sessionManager?.getSessionId?.() ? { sessionId: ctx.sessionManager.getSessionId() } : {}), ...(authFetchProfile ? { authFetchProfile } : {}) };
 			const fetchResults = await fetchAllContent(urlList, signal, fetchOptions);
+			const inlineMedia = options.mediaMode === "inline" && mode === "readable"
+				? await Promise.all(fetchResults.map(async (result) => {
+					const assets = (result.media ?? []).filter((asset) => asset.kind === "image").slice(0, 4);
+					const fetched = await Promise.all(assets.map(async (asset) => {
+						try {
+							const media = await fetchMediaWithEgoBrowser(asset.url, signal, {
+								...(ctx?.sessionManager?.getSessionId?.() ? { sessionId: ctx.sessionManager.getSessionId() } : {}),
+								...(asset.sourceUrl ? { sourceUrl: asset.sourceUrl } : {}),
+							});
+							return { asset, media };
+						} catch (error) {
+							return { asset, error: error instanceof Error ? error.message : String(error) };
+						}
+					}));
+					return { fetched, omitted: Math.max(0, (result.media?.filter((asset) => asset.kind === "image").length ?? 0) - assets.length) };
+				}))
+				: fetchResults.map(() => ({ fetched: [], omitted: 0 }));
 			const presentedResults = mode === "answer"
 				? await Promise.all(fetchResults.map(async result => {
 					if (result.error) return result;
@@ -2490,6 +2516,17 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				const content: Array<TextContent | ImageContent> = [];
+				const mediaResult = inlineMedia[0];
+				let inlineImageCount = 0;
+				for (const item of mediaResult?.fetched ?? []) {
+					if (item.media) {
+						content.push({ type: "image", data: item.media.data, mimeType: item.media.mimeType });
+						content.push({ type: "text", text: `Original page image retrieved: ${item.media.url} (${item.media.bytes} bytes; not screenshot)` });
+						inlineImageCount++;
+					} else if (item.error) {
+						content.push({ type: "text", text: `Original page image unavailable: ${item.asset.url}\n${item.error}` });
+					}
+				}
 				if (result.frames?.length) {
 					for (const frame of result.frames) {
 						content.push({ type: "image", data: frame.data, mimeType: frame.mimeType });
@@ -2500,7 +2537,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				content.push({ type: "text", text: output });
 
-				const imageCount = (result.frames?.length ?? 0) + (result.thumbnail ? 1 : 0);
+				const imageCount = (result.frames?.length ?? 0) + (result.thumbnail ? 1 : 0) + inlineImageCount;
 				return {
 					content,
 					details: {
@@ -2520,6 +2557,9 @@ export default function (pi: ExtensionAPI) {
 						frames: params.frames,
 						duration: result.duration,
 						mode,
+						mediaMode: options.mediaMode,
+						inlineMediaCount: inlineImageCount,
+						inlineMediaOmitted: mediaResult?.omitted ?? 0,
 						mimeType: result.mimeType,
 						status: result.status,
 						totalBytes: slice.totalBytes,
@@ -2544,16 +2584,27 @@ export default function (pi: ExtensionAPI) {
 					? `\n---\nUse ${toolNames.getSearchContent}({ responseId: "${responseId}", urlIndex: 0 }) to retrieve bounded content slices.`
 					: "\n---\nContent retrieval is not registered."
 				: "\n---\nAuthenticated fetch cache is off; repeat the fetch to read content.";
+			const multiContent: Array<TextContent | ImageContent> = [{ type: "text", text: output }];
+			let inlineImageCount = 0;
+			for (const mediaResult of inlineMedia) {
+				for (const item of mediaResult.fetched) {
+					if (item.media) {
+						multiContent.push({ type: "image", data: item.media.data, mimeType: item.media.mimeType });
+						multiContent.push({ type: "text", text: `Original page image retrieved: ${item.media.url} (${item.media.bytes} bytes; not screenshot)` });
+						inlineImageCount++;
+					}
+				}
+			}
 
 			return {
-				content: [{ type: "text", text: output }],
-				details: { urls: urlList, urlCount: urlList.length, successful, totalChars, ...(storedContent ? { responseId } : {}) },
+				content: multiContent,
+				details: { urls: urlList, urlCount: urlList.length, successful, totalChars, mediaMode: options.mediaMode, inlineMediaCount: inlineImageCount, ...(storedContent ? { responseId } : {}) },
 			};
 		},
 
 		renderCall(args, theme) {
 			const { urlList, options } = normalizeFetchContentParams(args);
-			const { prompt, timestamp, frames, model, mode, answerModel, auth } = options;
+			const { prompt, timestamp, frames, model, mode, answerModel, auth, mediaMode } = options;
 			if (urlList.length === 0) {
 				return new Text(theme.fg("toolTitle", theme.bold("fetch ")) + theme.fg("error", "(no URL)"), 0, 0);
 			}
@@ -2592,6 +2643,9 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (auth !== undefined) {
 				lines.push(theme.fg("dim", "  auth: ") + theme.fg("warning", auth === true ? "true" : auth));
+			}
+			if (mediaMode) {
+				lines.push(theme.fg("dim", "  media: ") + theme.fg("warning", mediaMode));
 			}
 			return new Text(lines.join("\n"), 0, 0);
 		},
@@ -2681,6 +2735,81 @@ export default function (pi: ExtensionAPI) {
 			const textContent = result.content.find((c) => c.type === "text")?.text || "";
 			const preview = textContent.length > 500 ? textContent.slice(0, 500) + "..." : textContent;
 			return new Text(statusLine + "\n" + theme.fg("dim", preview), 0, 0);
+		},
+	});
+
+	if (fetchMediaEnabled) pi.registerTool({
+		name: toolNames.fetchMedia,
+		label: "Fetch Media",
+		description: "Retrieve original image bytes from media URLs exposed by fetch_content, using the same authenticated Ego Browser Space as the source page. Pass sourceUrl for media hosted on a CDN or a different origin. Returns the original image to the model for inspection; it never presents a screenshot as the original file.",
+		promptSnippet: "Use after fetch_content returns a Media URL when the user wants to inspect or preserve the actual image. Pass the Media item's source page as sourceUrl, especially when the asset is on a CDN. Prefer this over opening the image in a tab and taking a screenshot.",
+		parameters: Type.Object({
+			url: Type.Optional(Type.String({ description: "One image URL from fetch_content's Media section" })),
+			urls: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 8, description: "Image URLs from fetch_content's Media section" })),
+			sourceUrl: Type.Optional(Type.String({ description: "The source page URL that exposed the media; enables generic logged-in/CDN media fetching" })),
+		}),
+
+		async execute(_toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<Record<string, unknown>>> {
+			const requested = [
+				...(typeof params.url === "string" ? [params.url] : []),
+				...(Array.isArray(params.urls) ? params.urls.filter((url): url is string => typeof url === "string") : []),
+			].map((url) => url.trim()).filter(Boolean);
+			const urlList = [...new Set(requested)].slice(0, 8);
+			if (urlList.length === 0) {
+				return { content: [{ type: "text", text: "Error: provide url or urls from a fetch_content Media section." }], details: { error: "No media URL provided" } };
+			}
+
+			onUpdate?.({
+				content: [{ type: "text", text: `Fetching ${urlList.length} original image(s) through Ego Browser...` }],
+				details: { phase: "media", progress: 0 },
+			});
+			const sessionId = ctx?.sessionManager?.getSessionId?.();
+			const results = await Promise.all(urlList.map(async (url) => {
+				try {
+					const media = await fetchMediaWithEgoBrowser(url, signal, {
+						...(sessionId ? { sessionId } : {}),
+						...(typeof params.sourceUrl === "string" && params.sourceUrl.trim() ? { sourceUrl: params.sourceUrl.trim() } : {}),
+					});
+					return { url, media };
+				} catch (error) {
+					return { url, error: error instanceof Error ? error.message : String(error) };
+				}
+			}));
+			if (signal?.aborted) return { content: [{ type: "text", text: "Aborted" }], details: { error: "Aborted" } };
+
+			const content: Array<TextContent | ImageContent> = [];
+			const mediaDetails: Array<Record<string, unknown>> = [];
+			for (const item of results) {
+				if (item.error || !item.media) {
+					content.push({ type: "text", text: `Failed: ${item.url}\n${item.error || "Unknown media error"}` });
+					mediaDetails.push({ url: item.url, error: item.error || "Unknown media error" });
+					continue;
+				}
+				content.push({ type: "image", data: item.media.data, mimeType: item.media.mimeType });
+				content.push({ type: "text", text: `Original image retrieved: ${item.media.url} (${item.media.bytes} bytes; ${item.media.mimeType}; browser-page-fetch, not screenshot)` });
+				mediaDetails.push({
+					requestedUrl: item.url,
+					url: item.media.url,
+					mimeType: item.media.mimeType,
+					bytes: item.media.bytes,
+					retrievalMethod: "ego-browser-page-fetch",
+					isOriginal: true,
+				});
+			}
+			const successful = results.filter((item) => item.media).length;
+			return {
+				content,
+				details: { urls: urlList, urlCount: urlList.length, successful, media: mediaDetails },
+			};
+		},
+
+		renderResult(result, { expanded }, theme) {
+			const details = result.details as { urlCount?: number; successful?: number; error?: string };
+			if (details?.error) return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
+			const status = `${details?.successful ?? 0}/${details?.urlCount ?? 0} original image(s)`;
+			if (!expanded) return new Text(theme.fg("success", status), 0, 0);
+			const text = result.content.filter((item): item is TextContent => item.type === "text").map((item) => item.text).join("\n");
+			return new Text(theme.fg("success", status) + (text ? `\n${theme.fg("dim", text)}` : ""), 0, 0);
 		},
 	});
 

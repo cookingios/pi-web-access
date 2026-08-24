@@ -9,6 +9,7 @@ export interface FetchContentParams {
 	mode?: unknown;
 	answerModel?: unknown;
 	auth?: unknown;
+	mediaMode?: unknown;
 }
 
 export interface NormalizedFetchContentParams {
@@ -22,6 +23,7 @@ export interface NormalizedFetchContentParams {
 		mode?: "readable" | "raw" | "answer";
 		answerModel?: string;
 		auth?: true | string;
+		mediaMode?: "links" | "inline";
 	};
 }
 
@@ -39,6 +41,7 @@ export function normalizeFetchContentParams(params: FetchContentParams): Normali
 	const mode = normalizeMode(params.mode);
 	const answerModel = normalizeOptionalString(params.answerModel);
 	const auth = normalizeAuth(params.auth);
+	const mediaMode = normalizeMediaMode(params.mediaMode);
 
 	return {
 		urlList,
@@ -51,8 +54,15 @@ export function normalizeFetchContentParams(params: FetchContentParams): Normali
 			...(mode !== undefined ? { mode } : {}),
 			...(answerModel !== undefined ? { answerModel } : {}),
 			...(auth !== undefined ? { auth } : {}),
+			...(mediaMode !== undefined ? { mediaMode } : {}),
 		},
 	};
+}
+
+function normalizeMediaMode(value: unknown): "links" | "inline" | undefined {
+	if (value === undefined) return undefined;
+	if (value === "links" || value === "inline") return value;
+	throw new Error('mediaMode must be "links" or "inline"');
 }
 
 function normalizeUrlArray(value: unknown): string[] {
