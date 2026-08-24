@@ -20,8 +20,18 @@ const DEFAULT_DOMAINS = [
 	"mp.weixin.qq.com",
 	"feishu.cn",
 	"larksuite.com",
+	"reddit.com",
+	"xiaohongshu.com",
 ];
-const DEFAULT_MEDIA_DOMAINS = ["pbs.twimg.com", "video.twimg.com"];
+const DEFAULT_MEDIA_DOMAINS = [
+	"pbs.twimg.com",
+	"video.twimg.com",
+	"i.pximg.net",
+	"preview.redd.it",
+	"i.redd.it",
+	"v.redd.it",
+	"xhscdn.com",
+];
 
 export interface EgoBrowserConfig {
 	enabled: boolean;
@@ -218,34 +228,79 @@ function buildScript(url: string, spaceName: string, timeoutMs: number): string 
 	return `
 const task = await useOrCreateTaskSpace(${JSON.stringify(spaceName)})
 await openOrReuseTab(${JSON.stringify(url)}, { wait: true, timeout: ${timeoutSeconds} })
-await wait(2)
+await wait(3)
 const info = await pageInfo()
 const snapshot = await snapshotText()
 let dom = {}
 try {
   dom = await js(String.raw\`(() => {
-    const article = [...document.querySelectorAll('article[data-testid="tweet"], article')]
-      .find((el) => el.querySelector('time')) || null
-    const scope = article || document
-    const isX = location.hostname === 'x.com' || location.hostname.endsWith('.x.com') || location.hostname === 'twitter.com' || location.hostname.endsWith('.twitter.com')
-    const imageUrls = [...scope.querySelectorAll('img[src]')]
-      .map((el) => el.src)
-      .filter(Boolean)
-      .filter((src) => !isX || /pbs\\.twimg\\.com\\/media\\//.test(src))
-      .map((src) => {
-        try {
-          const parsed = new URL(src)
-          if (parsed.hostname === 'pbs.twimg.com' && parsed.pathname.startsWith('/media/')) parsed.searchParams.set('name', 'orig')
-          return parsed.toString()
-        } catch { return src }
-      })
-    const videoUrls = [...scope.querySelectorAll('video, video source')]
-      .map((el) => el.currentSrc || el.src)
-      .filter(Boolean)
+    const hostname = location.hostname.toLowerCase()
+    const isX = hostname === 'x.com' || hostname.endsWith('.x.com') || hostname === 'twitter.com' || hostname.endsWith('.twitter.com')
+    const isPixiv = hostname === 'pixiv.net' || hostname.endsWith('.pixiv.net')
+    const isReddit = hostname === 'reddit.com' || hostname.endsWith('.reddit.com')
+    const isXiaohongshu = hostname === 'xiaohongshu.com' || hostname.endsWith('.xiaohongshu.com')
+    const article = !isPixiv && !isReddit && !isXiaohongshu
+      ? [...document.querySelectorAll('article[data-testid="tweet"], article')].find((el) => el.querySelector('time')) || null
+      : null
+    const redditPost = isReddit
+      ? document.querySelector('shreddit-post, [data-testid="post-container"], article')
+      : null
+    const scope = article || redditPost || document
+    const scopedToPost = Boolean(article || redditPost)
+    const unique = (values) => [...new Set(values.filter(Boolean))]
+    const hostMatchesUrl = (src, domain) => {
+      try {
+        const host = new URL(src).hostname.toLowerCase()
+        return host === domain || host.endsWith('.' + domain)
+      } catch { return false }
+    }
+    const normalizeUrl = (src) => {
+      try {
+        const parsed = new URL(src)
+        if (parsed.hostname === 'pbs.twimg.com' && parsed.pathname.startsWith('/media/')) parsed.searchParams.set('name', 'orig')
+        return parsed.toString()
+      } catch { return src }
+    }
+    const imageUrls = (() => {
+      if (isPixiv) {
+        const originalLinks = [...document.querySelectorAll('a[href*="/img-original/"]')]
+          .map((el) => el.href)
+        const renderedImages = [...document.querySelectorAll('a[href*="/img-original/"] img[src]')]
+          .map((el) => el.currentSrc || el.src)
+        return unique([...originalLinks, ...renderedImages].map(normalizeUrl))
+      }
+      if (isReddit) {
+        const primary = [...scope.querySelectorAll('img.media-lightbox-img, shreddit-gallery img')]
+        const candidates = (primary.length > 0 ? primary : [...scope.querySelectorAll('img[src]')])
+          .map((el) => el.currentSrc || el.src)
+          .filter((src) => hostMatchesUrl(src, 'preview.redd.it') || hostMatchesUrl(src, 'i.redd.it'))
+          .filter((src) => !src.toLowerCase().includes('snoovatar') && !src.toLowerCase().includes('/avatars/'))
+        return unique(candidates.map(normalizeUrl))
+      }
+      if (isXiaohongshu) {
+        const candidates = [...document.querySelectorAll('[elementtiming="note-cover"] img[src], .note-slider-img img[src], img[src*="/notes_pre_post/"]')]
+          .map((el) => el.currentSrc || el.src)
+          .filter((src) => hostMatchesUrl(src, 'xhscdn.com') && src.includes('/notes_pre_post/'))
+        return unique(candidates.map(normalizeUrl))
+      }
+      return unique([...scope.querySelectorAll('img[src]')]
+        .map((el) => el.currentSrc || el.src)
+        .filter(Boolean)
+        .filter((src) => !isX || /pbs\\.twimg\\.com\\/media\\//.test(src))
+        .map(normalizeUrl))
+    })()
+    const videoUrls = (() => {
+      const candidates = [...scope.querySelectorAll('video, video source')]
+        .map((el) => el.currentSrc || el.src)
+        .filter(Boolean)
+      if (isXiaohongshu) return unique(candidates.filter((src) => hostMatchesUrl(src, 'xhscdn.com')))
+      if (isReddit) return unique(candidates.filter((src) => hostMatchesUrl(src, 'redd.it') || hostMatchesUrl(src, 'redditmedia.com')))
+      return unique(candidates)
+    })()
     const sourceUrl = location.href
     const media = [
-      ...imageUrls.map((url) => ({ kind: 'image', url, source: article ? 'article' : 'page', sourceUrl })),
-      ...videoUrls.map((url) => ({ kind: 'video', url, source: article ? 'article' : 'page', sourceUrl })),
+      ...imageUrls.map((url) => ({ kind: 'image', url, source: scopedToPost ? 'article' : 'page', sourceUrl })),
+      ...videoUrls.map((url) => ({ kind: 'video', url, source: scopedToPost ? 'article' : 'page', sourceUrl })),
     ]
     return {
     text: document.body?.innerText || '',

@@ -64,12 +64,19 @@ When `ego-browser` is installed, known dynamic or login-aware domains are opened
       "x.com",
       "twitter.com",
       "pixiv.net",
+      "reddit.com",
+      "xiaohongshu.com",
       "instagram.com",
       "feishu.cn"
     ],
     "mediaDomains": [
       "pbs.twimg.com",
-      "video.twimg.com"
+      "video.twimg.com",
+      "i.pximg.net",
+      "preview.redd.it",
+      "i.redd.it",
+      "v.redd.it",
+      "xhscdn.com"
     ],
     "timeoutMs": 45000,
     "spacePrefix": "pi-web-access"
@@ -174,7 +181,7 @@ fetch_content({ url: "https://example.com/diagram.png" })
 fetch_content({ url: "https://x.com/user/status/123", mediaMode: "inline" })
 ```
 
-When a dynamic page returns a `## Media` section, use `fetch_media` for image inspection and pass the source page URL. It reuses that page's logged-in Ego Browser context, works across CDN/media origins, normalizes X images to `name=orig`, and returns the original image bytes directly to the model. It does not treat a screenshot as the original file.
+When a dynamic page returns a `## Media` section, use `fetch_media` for image inspection and pass the source page URL. It reuses that page's logged-in Ego Browser context, works across CDN/media origins, normalizes X images to `name=orig`, and returns the original image bytes directly to the model when the site's media origin permits browser fetching. Some sites, including Pixiv, may expose an image in the page while rejecting a separate binary request with HTTP 403; the tool reports that limitation instead of substituting a screenshot.
 
 ```typescript
 fetch_media({ url: "https://cdn.example.com/assets/example.jpg", sourceUrl: "https://example.com/post/123" })

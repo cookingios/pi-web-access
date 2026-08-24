@@ -2348,7 +2348,7 @@ export default function (pi: ExtensionAPI) {
 	if (fetchContentEnabled) pi.registerTool({
 		name: toolNames.fetchContent,
 		label: "Fetch Content",
-		description: `Fetch URL(s) and extract readable content as markdown. Dynamic or login-aware sites such as X, Pixiv, Instagram, Feishu, and Weibo use an isolated Ego Browser Space before static fetch fallbacks. Use mode "raw" for exact textual HTTP response bodies or mode "answer" with prompt to answer using only fetched content. Direct image URLs return resized image content. Use mediaMode "inline" when the user needs to inspect images attached to a dynamic page; it retrieves original image bytes through the browser session instead of opening the image and taking a screenshot. Use fetch_media for an explicit follow-up or retry. Supports YouTube transcripts, GitHub repositories, PDFs, and local videos. ${fetchContentStorageNote}`,
+		description: `Fetch URL(s) and extract readable content as markdown. Dynamic or login-aware sites such as X, Pixiv, Instagram, Feishu, Weibo, Reddit, and Xiaohongshu use an isolated Ego Browser Space before static fetch fallbacks. Use mode "raw" for exact textual HTTP response bodies or mode "answer" with prompt to answer using only fetched content. Direct image URLs return resized image content. Use mediaMode "inline" when the user needs to inspect images attached to a dynamic page; it attempts to retrieve image bytes through the browser session instead of opening the image and taking a screenshot. Use fetch_media for an explicit follow-up or retry. Supports YouTube transcripts, GitHub repositories, PDFs, and local videos. ${fetchContentStorageNote}`,
 		promptSnippet:
 			"Use for a known URL. Dynamic/login-aware pages use an isolated Ego Browser Space; do not switch to keyword search just because direct fetching is blocked. When the user needs to inspect an attachment, set mediaMode to inline or call fetch_media on the returned Media URL; do not use a screenshot as the original file.",
 		parameters: Type.Object({
@@ -2381,7 +2381,7 @@ export default function (pi: ExtensionAPI) {
 				description: "Opt into an authFetch profile for local browser-cookie fetching. Use a profile name, or true only when exactly one profile exists.",
 			})),
 			mediaMode: Type.Optional(StringEnum(["links", "inline"], {
-				description: "Dynamic-page media handling: links (default) lists discovered media URLs; inline retrieves original image bytes through the same Ego Browser Space for model inspection.",
+				description: "Dynamic-page media handling: links (default) lists discovered media URLs; inline attempts to retrieve image bytes through the same Ego Browser Space for model inspection.",
 			})),
 		}),
 
@@ -2741,7 +2741,7 @@ export default function (pi: ExtensionAPI) {
 	if (fetchMediaEnabled) pi.registerTool({
 		name: toolNames.fetchMedia,
 		label: "Fetch Media",
-		description: "Retrieve original image bytes from media URLs exposed by fetch_content, using the same authenticated Ego Browser Space as the source page. Pass sourceUrl for media hosted on a CDN or a different origin. Returns the original image to the model for inspection; it never presents a screenshot as the original file.",
+		description: "Retrieve image bytes from media URLs exposed by fetch_content, using the same authenticated Ego Browser Space as the source page. Pass sourceUrl for media hosted on a CDN or a different origin. Returns the fetched image to the model when the site permits browser access; it reports CDN errors instead of presenting a screenshot as the original file.",
 		promptSnippet: "Use after fetch_content returns a Media URL when the user wants to inspect or preserve the actual image. Pass the Media item's source page as sourceUrl, especially when the asset is on a CDN. Prefer this over opening the image in a tab and taking a screenshot.",
 		parameters: Type.Object({
 			url: Type.Optional(Type.String({ description: "One image URL from fetch_content's Media section" })),
@@ -2786,7 +2786,7 @@ export default function (pi: ExtensionAPI) {
 					continue;
 				}
 				content.push({ type: "image", data: item.media.data, mimeType: item.media.mimeType });
-				content.push({ type: "text", text: `Original image retrieved: ${item.media.url} (${item.media.bytes} bytes; ${item.media.mimeType}; browser-page-fetch, not screenshot)` });
+				content.push({ type: "text", text: `Image bytes retrieved: ${item.media.url} (${item.media.bytes} bytes; ${item.media.mimeType}; browser-page-fetch, not screenshot)` });
 				mediaDetails.push({
 					requestedUrl: item.url,
 					url: item.media.url,

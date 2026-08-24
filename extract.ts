@@ -639,7 +639,7 @@ export async function extractContent(
 					...page.images.map((image): EgoBrowserMedia => ({ kind: "image", url: image, source: "page", sourceUrl: page.url || url })),
 					...page.videos.map((video): EgoBrowserMedia => ({ kind: "video", url: video, source: "page", sourceUrl: page.url || url })),
 				];
-				const mediaLines = media.map((asset, index) => `- ${asset.kind === "image" ? "Image" : "Video"} ${index + 1} (${asset.source}; source page: ${asset.sourceUrl || page.url || url}; original bytes available via fetch_media): ${asset.url}`);
+				const mediaLines = media.map((asset, index) => `- ${asset.kind === "image" ? "Image" : "Video"} ${index + 1} (${asset.source}; source page: ${asset.sourceUrl || page.url || url}; binary fetch can be attempted via fetch_media): ${asset.url}`);
 				const links = page.links.length > 0 ? `\n\n## Links\n${page.links.map((link) => `- ${link}`).join("\n")}` : "";
 				const mediaText = media.length > 0 ? `\n\n## Media\n${mediaLines.join("\n")}` : "";
 				return {
