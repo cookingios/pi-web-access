@@ -66,6 +66,7 @@ When `ego-browser` is installed, known dynamic or login-aware domains are opened
       "pixiv.net",
       "reddit.com",
       "xiaohongshu.com",
+      "xueqiu.com",
       "instagram.com",
       "feishu.cn"
     ],
@@ -76,7 +77,8 @@ When `ego-browser` is installed, known dynamic or login-aware domains are opened
       "preview.redd.it",
       "i.redd.it",
       "v.redd.it",
-      "xhscdn.com"
+      "xhscdn.com",
+      "xqimg.imedao.com"
     ],
     "timeoutMs": 45000,
     "spacePrefix": "pi-web-access"
