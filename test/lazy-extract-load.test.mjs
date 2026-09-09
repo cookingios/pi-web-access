@@ -73,7 +73,7 @@ function buildChildScript(moduleUrl) {
 		initializeExtension(pi);
 		assert.deepEqual(
 			tools.map((tool) => tool.name),
-			["web_search", "source_check", "fetch_content", "fetch_media", "get_search_content"],
+			["web_search", "source_check", "fetch_content", "douyin_favorites", "fetch_media", "get_search_content"],
 		);
 		assert.ok(commands.includes("websearch"), "websearch command was not registered");
 		assert.ok(shortcuts.length > 0, "shortcuts were not registered");

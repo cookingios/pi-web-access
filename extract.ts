@@ -1,9 +1,11 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { Readability } from "@mozilla/readability";
 import { resizeImage } from "@earendil-works/pi-coding-agent";
 import { parseHTML } from "linkedom";
 import TurndownService from "turndown";
 import pLimit from "p-limit";
+import { basename, dirname, join } from "node:path";
 import { activityMonitor } from "./activity.ts";
 import { extractRSCContent } from "./rsc-extract.ts";
 import { extractPDFToMarkdown, isPDF, loadPDFConfig } from "./pdf-extract.ts";
@@ -28,7 +30,7 @@ import { isImageEnabled } from "./feature-config.ts";
 import { assertAuthFetchUrl, authFetchRedirectGuard, type AuthFetchProfile } from "./auth-fetch.ts";
 import { getBrowserCookiesForHosts, getLastBrowserCookieDiagnostic } from "./chrome-cookies.ts";
 import { sanitizeInlineDataUris } from "./data-uri-sanitize.ts";
-import { fetchWithEgoBrowser, shouldUseEgoBrowser, type EgoBrowserMedia } from "./ego-browser.ts";
+import { isEgoBrowserStoppedError, fetchWithEgoBrowser, fetchDouyinVideoWithEgoBrowser, getDouyinVideoId, isDouyinVideoURL, shouldUseEgoBrowser, type DouyinVideoResult, type EgoBrowserMedia } from "./ego-browser.ts";
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const CONCURRENT_LIMIT = 3;
@@ -388,6 +390,127 @@ function safeVideoInfo(url: string): LocalVideoInfoResult {
 	}
 }
 
+type DouyinFinalResources = { localPath: string; audioPath: string; audioBytes: number };
+
+function mergeDouyinTracks(download: DouyinVideoResult): DouyinFinalResources {
+	const directory = dirname(download.videoPath);
+	const mergedPath = join(directory, "video.mp4");
+	const audioPath = join(directory, "audio.m4a");
+	if (basename(download.videoPath) === "video.mp4" && download.audioPath && basename(download.audioPath) === "audio.m4a" && existsSync(mergedPath) && existsSync(audioPath)) {
+		return { localPath: mergedPath, audioPath, audioBytes: statSync(audioPath).size };
+	}
+	if (!download.audioPath || !existsSync(download.audioPath)) {
+		try {
+			execFileSync("ffmpeg", [
+				"-y",
+				"-i", download.videoPath,
+				"-map", "0:a:0",
+				"-vn",
+				"-c:a", "copy",
+				audioPath,
+			], { timeout: 60_000, maxBuffer: 2 * 1024 * 1024, stdio: ["ignore", "ignore", "pipe"] });
+			renameSync(download.videoPath, mergedPath);
+			return { localPath: mergedPath, audioPath, audioBytes: statSync(audioPath).size };
+		} catch (err) {
+			throw new Error(`Could not extract audio from the Douyin video: ${errorMessage(err)}`);
+		}
+	}
+	if (!existsSync(download.audioPath)) {
+		throw new Error("Douyin audio resource was not downloaded; cannot create the final muxed video");
+	}
+	try {
+		execFileSync("ffmpeg", [
+			"-y",
+			"-i", download.videoPath,
+			"-i", download.audioPath,
+			"-map", "0:v:0",
+			"-map", "1:a:0",
+			"-c:v", "copy",
+			"-c:a", "copy",
+			"-shortest",
+			mergedPath,
+		], { timeout: 60_000, maxBuffer: 2 * 1024 * 1024, stdio: ["ignore", "ignore", "pipe"] });
+		try { unlinkSync(download.videoPath); } catch { /* best-effort cleanup of the internal video track */ }
+		if (download.audioPath !== audioPath) renameSync(download.audioPath, audioPath);
+		return {
+			localPath: mergedPath,
+			audioPath,
+			audioBytes: download.audioBytes ?? statSync(audioPath).size,
+		};
+	} catch (err) {
+		throw new Error(`Could not mux Douyin video and audio: ${errorMessage(err)}`);
+	}
+}
+
+function writeDouyinMetadata(download: DouyinVideoResult, resources: DouyinFinalResources, requestedUrl: string): string {
+	const metadataPath = join(dirname(resources.localPath), "metadata.json");
+	const metadata = {
+		schemaVersion: 1,
+		requestedUrl,
+		canonicalUrl: download.url,
+		videoId: getDouyinVideoId(download.url),
+		author: download.author || null,
+		publishedAt: download.publishedAt || null,
+		title: download.title || null,
+		caption: download.caption || download.title || null,
+		description: download.description || null,
+		collection: {
+			name: download.collectionName || null,
+			id: download.collectionId || null,
+			url: download.collectionUrl || null,
+		},
+		durationSeconds: typeof download.duration === "number" ? download.duration : null,
+		resources: {
+			muxedVideo: { path: resources.localPath, bytes: statSync(resources.localPath).size },
+			audio: { path: resources.audioPath, bytes: resources.audioBytes },
+		},
+		pageText: download.text,
+	};
+	writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, { mode: 0o600 });
+	return metadataPath;
+}
+
+function formatDouyinMetadata(download: DouyinVideoResult, resources: DouyinFinalResources, metadataPath: string): string {
+	const lines = [
+		"## 抖音视频资源",
+		`- 标题：${download.title || "未读取到标题"}`,
+		`- 时长：${typeof download.duration === "number" ? formatSeconds(Math.floor(download.duration)) : "未知"}`,
+		`- 合成视频（画面 + 音频）：${resources.localPath}`,
+		`- 独立音频文件：${resources.audioPath}`,
+		`- 元数据文件：${metadataPath}`,
+	];
+	if (download.author) lines.push(`- 作者：${download.author}`);
+	if (download.publishedAt) lines.push(`- 发布时间：${download.publishedAt}`);
+	if (download.caption) lines.push(`- 视频文案：${download.caption}`);
+	if (download.collectionName) lines.push(`- 所属合集：${download.collectionName}`);
+	if (resources.audioBytes) lines.push(`- 音频资源大小：${resources.audioBytes} bytes`);
+	if (download.description) lines.push(`- 页面描述：${download.description}`);
+	const text = download.text.trim();
+	return text ? `${lines.join("\n")}\n\n## 抖音页面文字与章节\n${text}` : lines.join("\n");
+}
+
+async function extractDouyinVideo(
+	url: string,
+	signal?: AbortSignal,
+	options?: ExtractOptions,
+): Promise<ExtractedContent> {
+	const download = await fetchDouyinVideoWithEgoBrowser(url, signal, { sessionId: options?.sessionId });
+	if (signal?.aborted) return abortedResult(url);
+	const finalResources = mergeDouyinTracks(download);
+	const metadataPath = writeDouyinMetadata(download, finalResources, url);
+	const metadata = formatDouyinMetadata(download, finalResources, metadataPath);
+	return {
+		url,
+		title: download.title || `Douyin video ${url}`,
+		content: metadata,
+		error: null,
+		source: "ego-browser" as const,
+		taskSpaceId: download.taskSpaceId,
+		duration: download.duration,
+		mimeType: "video/mp4",
+	};
+}
+
 export async function extractContent(
 	url: string,
 	signal?: AbortSignal,
@@ -428,6 +551,15 @@ export async function extractContent(
 
 	if (options?.mode === "raw") {
 		return extractViaHttp(url, signal, options);
+	}
+
+	if (isDouyinVideoURL(url) && options?.mode !== "answer") {
+		try {
+			return await extractDouyinVideo(url, signal, options);
+		} catch (err) {
+			if (isAbortError(err)) return abortedResult(url);
+			return { url, title: "", content: "", error: errorMessage(err) };
+		}
 	}
 
 	if (options?.frames || options?.timestamp) {
@@ -653,6 +785,7 @@ export async function extractContent(
 				};
 			} catch (err) {
 				if (isAbortError(err)) return abortedResult(url);
+				if (isEgoBrowserStoppedError(err)) return { url, title: "", content: "", error: errorMessage(err), source: "ego-browser" };
 				egoBrowserError = errorMessage(err);
 			}
 		}

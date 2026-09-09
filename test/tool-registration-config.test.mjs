@@ -65,7 +65,7 @@ test("malformed config falls back during extension registration", () => {
 	const child = runRegistrationWithConfig("{");
 	assert.equal(child.status, 0, child.stderr);
 	const registered = JSON.parse(child.stdout);
-	assert.deepEqual(registered.tools.map(tool => tool.name), ["web_search", "source_check", "fetch_content", "fetch_media", "get_search_content"]);
+	assert.deepEqual(registered.tools.map(tool => tool.name), ["web_search", "source_check", "fetch_content", "douyin_favorites", "fetch_media", "get_search_content"]);
 });
 
 test("search tools constrain numResults to integer values from 1 through 20", () => {
@@ -84,21 +84,25 @@ test("search tools constrain numResults to integer values from 1 through 20", ()
 });
 
 test("tool registration gates support legacy and per-tool config", () => {
-	assert.deepEqual(registeredToolNames({ webSearch: { enabled: false } }), ["fetch_content", "fetch_media", "get_search_content"]);
+	assert.deepEqual(registeredToolNames({ webSearch: { enabled: false } }), ["fetch_content", "douyin_favorites", "fetch_media", "get_search_content"]);
 	assert.deepEqual(registeredToolNames({
 		webSearch: { enabled: false },
 		tools: { webSearch: { enabled: true }, sourceCheck: { enabled: true }, fetchContent: { enabled: false } },
-	}), ["web_search", "source_check", "fetch_media", "get_search_content"]);
+	}), ["web_search", "source_check", "douyin_favorites", "fetch_media", "get_search_content"]);
 	assert.deepEqual(registeredToolNames({
 		tools: { sourceCheck: { enabled: false }, getSearchContent: { enabled: false } },
-	}), ["web_search", "fetch_content", "fetch_media"]);
+	}), ["web_search", "fetch_content", "douyin_favorites", "fetch_media"]);
 });
 
 test("command registration gates default to enabled", () => {
-	assert.deepEqual(registeredCommandNames({}), ["websearch", "curator", "google-account", "search"]);
+	assert.deepEqual(registeredCommandNames({}), ["web-browser-resume", "websearch", "curator", "google-account", "search"]);
 	assert.deepEqual(registeredCommandNames({
 		commands: { websearch: { enabled: false }, search: { enabled: false } },
-	}), ["curator", "google-account"]);
+	}), ["web-browser-resume", "curator", "google-account"]);
+});
+
+test("browser resume command can be disabled", () => {
+ assert.ok(!registeredCommandNames({commands:{"web-browser-resume":{enabled:false}}}).includes("web-browser-resume"));
 });
 
 test("fetch_content schema exposes auth profile opt-in", () => {
@@ -142,7 +146,7 @@ test("web activity shortcut renders through the supported string-array API", asy
 });
 
 test("tool names can be configured without changing defaults", () => {
-	assert.deepEqual(registeredToolNames({}), ["web_search", "source_check", "fetch_content", "fetch_media", "get_search_content"]);
+	assert.deepEqual(registeredToolNames({}), ["web_search", "source_check", "fetch_content", "douyin_favorites", "fetch_media", "get_search_content"]);
 	assert.deepEqual(registeredToolNames({
 		toolNames: {
 			webSearch: "research_web",
@@ -150,7 +154,7 @@ test("tool names can be configured without changing defaults", () => {
 			fetchContent: "grab_content",
 			getSearchContent: "open_content",
 		},
-	}), ["research_web", "verify_sources", "grab_content", "fetch_media", "open_content"]);
+	}), ["research_web", "verify_sources", "grab_content", "douyin_favorites", "fetch_media", "open_content"]);
 });
 
 test("tool name config rejects invalid and duplicate registered names", () => {
@@ -167,7 +171,7 @@ test("webSearch.enabled false registers only fetch tools and ignores disabled-na
 			fetchContent: "grab_content",
 			getSearchContent: "open_content",
 		},
-	}), ["grab_content", "fetch_media", "open_content"]);
+	}), ["grab_content", "douyin_favorites", "fetch_media", "open_content"]);
 	assert.match(registrationError({
 		webSearch: { enabled: false },
 		toolNames: { fetchContent: "same_name", getSearchContent: "same_name" },

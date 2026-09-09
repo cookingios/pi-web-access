@@ -65,6 +65,8 @@ const pages = [
   shouldUseEgoBrowser("https://xueqiu.com/4641860462/406244638"),
   shouldUseEgoBrowser("https://weibo.com/2634877355/ReQqI8KaY"),
   shouldUseEgoBrowser("https://articles.zsxq.com/id_example.html"),
+  shouldUseEgoBrowser("https://www.douyin.com/video/7675681543088752115"),
+  shouldUseEgoBrowser("https://www.douyin.com/user/example?vid=7675681543088752115"),
 ];
 const media = [
   shouldUseEgoBrowserMedia("https://i.pximg.net/img-master/example.jpg"),
@@ -74,6 +76,7 @@ const media = [
   shouldUseEgoBrowserMedia("https://wx2.sinaimg.cn/large/example.jpg"),
   shouldUseEgoBrowserMedia("https://f.video.weibocdn.com/example.mp4"),
   shouldUseEgoBrowserMedia("https://article-images.zsxq.com/example.jpg"),
+  shouldUseEgoBrowserMedia("https://v26-web.douyinvod.com/example.mp4"),
 ];
 console.log(JSON.stringify({ pages, media }));
 `,
@@ -89,9 +92,58 @@ console.log(JSON.stringify({ pages, media }));
 
 	assert.equal(child.status, 0, child.stderr);
 	assert.deepEqual(JSON.parse(child.stdout.trim()), {
-        pages: [true, true, true, true, true, true],
-        media: [true, true, true, true, true, true, true],
+		pages: [true, true, true, true, true, true, true, true],
+		media: [true, true, true, true, true, true, true, true],
 	});
+});
+
+test("Douyin collection links prefer the modal video id over the embedded vid", () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-ego-douyin-url-"));
+	const child = spawnSync(process.execPath, ["--input-type=module"], {
+		input: `
+const { getDouyinVideoId, isDouyinVideoURL, normalizeDouyinVideoURL } = await import(${JSON.stringify(new URL("../ego-browser.ts", import.meta.url).href)});
+const collectionUrl = "https://www.douyin.com/user/example?modal_id=7434048670523329832&vid=7675681543088752115";
+const vidOnlyUrl = "https://www.douyin.com/user/example?vid=7675681543088752115";
+console.log(JSON.stringify({
+  collectionId: getDouyinVideoId(collectionUrl),
+  collectionSupported: isDouyinVideoURL(collectionUrl),
+  normalized: normalizeDouyinVideoURL(collectionUrl),
+  vidOnlyId: getDouyinVideoId(vidOnlyUrl),
+  invalid: isDouyinVideoURL("https://www.douyin.com/user/example"),
+}));
+`,
+		encoding: "utf8",
+		env: {
+			...process.env,
+			PI_CODING_AGENT_DIR: root,
+			HOME: root,
+			USERPROFILE: root,
+		},
+		maxBuffer: 2 * 1024 * 1024,
+	});
+
+	assert.equal(child.status, 0, child.stderr);
+	assert.deepEqual(JSON.parse(child.stdout.trim()), {
+		collectionId: "7434048670523329832",
+		collectionSupported: true,
+		normalized: "https://www.douyin.com/video/7434048670523329832",
+		vidOnlyId: "7675681543088752115",
+		invalid: false,
+	});
+});
+
+test("Douyin video downloads stage source tracks separately from final artifact names", async () => {
+	const { buildDouyinVideoScript } = await import("../ego-browser.ts");
+	const script = buildDouyinVideoScript(
+		"https://www.douyin.com/video/7462269663943183642",
+		"pi-web-access-test-douyin",
+		30_000,
+		"/tmp/pi-web-access-douyin-run",
+	);
+	assert.match(script, /video-source\.mp4/);
+	assert.match(script, /audio-source\.m4a/);
+	assert.doesNotMatch(script, /douyin-video-track\.mp4/);
+	assert.doesNotMatch(script, /douyin-audio-track\.m4a/);
 });
 
 test("configured media hosts return original image bytes through Ego Browser", () => {

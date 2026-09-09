@@ -54,7 +54,13 @@ Works immediately with no API keys — Exa MCP provides zero-config search. If P
 
 ### Ego Browser Spaces
 
-When `ego-browser` is installed, known dynamic or login-aware domains are opened in an isolated Ego Browser Space before static HTTP fallbacks. The browser route uses the `ego-browser nodejs` helper API only; it does not use CDP, `agent-browser`, or a localhost debugging proxy. The same Pi session and hostname reuse the same Space, and session shutdown closes Spaces created by the extension.
+When `ego-browser` is installed, known dynamic or login-aware domains use Ego Lite through `ego-browser nodejs` and the v2 TaskSpace/Page API. One browser goal shares a Space across domains, page reads, media retrieval, and Douyin favorites/video steps. The extension records the numeric `spaceId` and durable Page label between CLI rounds and navigates the same Page in place. Timeouts use milliseconds. It does not import Playwright or use a debugging proxy.
+
+A browser goal lasts through the active Pi agent run and its automatic continuations. After successful completion, the `agent_settled` hook awaits `task.finish({ keep: [] })` once; pending background fetches retain the Space until their continuation settles. Error, abort, user-control, and shutdown paths retain the Space. Browser failures after Space creation stop further browser work and do not fall back to HTTP/providers. A missing CLI can still use the original fallback route. Failed finish attempts retain their record and are not automatically repeated.
+
+After handling a browser prompt or stop, explicitly run `/web-browser-resume` to authorize resuming the recorded Space, then retry the operation. This command uses the numeric ID, claims a user-owned Space only on this explicit request, and adopts an unmanaged user Page before reuse. It never creates a replacement for a stopped Space. Disable it with `commands["web-browser-resume"].enabled: false` if needed. Goal records live in the extension process; after a Pi restart, retained Spaces must be inspected manually rather than guessed by name.
+
+Page extraction uses `page.evaluate()` with a full-page snapshot only when DOM text is empty; no action refs are cached across calls. Media bytes keep their existing fetch/archiving paths. Browser dialogs are handed to the user instead of being automatically accepted or dismissed.
 
 ```json
 {
@@ -70,7 +76,8 @@ When `ego-browser` is installed, known dynamic or login-aware domains are opened
       "weibo.com",
       "articles.zsxq.com",
       "instagram.com",
-      "feishu.cn"
+      "feishu.cn",
+      "douyin.com"
     ],
     "mediaDomains": [
       "pbs.twimg.com",
@@ -83,7 +90,9 @@ When `ego-browser` is installed, known dynamic or login-aware domains are opened
       "xqimg.imedao.com",
       "sinaimg.cn",
       "weibocdn.com",
-      "article-images.zsxq.com"
+      "article-images.zsxq.com",
+      "douyinvod.com",
+      "douyinpic.com"
     ],
     "timeoutMs": 45000,
     "spacePrefix": "pi-web-access"
@@ -186,9 +195,14 @@ fetch_content({ url: "https://example.com/guide", mode: "answer", prompt: "What 
 fetch_content({ url: "https://example.com/account", auth: "work", mode: "raw" })
 fetch_content({ url: "https://example.com/diagram.png" })
 fetch_content({ url: "https://x.com/user/status/123", mediaMode: "inline" })
+fetch_content({ url: "https://www.douyin.com/user/example?modal_id=7473423764718505243&vid=7675681543088752115" })
 ```
 
-When a dynamic page returns a `## Media` section, use `fetch_media` for image inspection and pass the source page URL. It reuses that page's logged-in Ego Browser context, works across CDN/media origins, normalizes X images to `name=orig`, saves an intermediate copy under `~/Desktop/Temp/pi-web-access/<session>/`, and returns the original image bytes directly only when the current model advertises image input. Text-only models receive the local path so a vision bridge can process it without a shell `curl` request. Some sites, including Pixiv, may expose an image in the page while rejecting a separate binary request with HTTP 403; the tool reports that limitation instead of substituting a screenshot.
+Douyin video links can be direct `/video/<id>` URLs or user/collection links carrying numeric `modal_id` and/or `vid` query parameters. The logged-in Ego Browser route prefers `modal_id` (the selected video in the page), falls back to `vid` when needed, and normalizes the link to the requested video. It supports both separate Douyin video/audio resources and pages exposing one already-muxed MP4 through the `<video>` element; the latter is used as the muxed output while its audio stream is extracted to M4A. Completed resources are archived under `~/Desktop/Web-Access/pi-web-access/douyin/<YYYY-MM-DD>_<video-id>_<title>/` as `video.mp4`, `audio.m4a`, and `metadata.json`. The metadata index contains the author, publish time, caption, collection, resource paths, and captured page text. In-progress downloads use `.runs/` and stale run directories are cleaned after 24 hours. This resource step does not require Gemini; video understanding is an optional later step.
+
+The `douyin_favorites` tool accepts an exact favorite-folder name through `folder` (for example `美食`, `spa`, or `公园`) and an optional `creator` filter. Douyin keeps the top-level URL unchanged while switching folders, so the tool selects the folder card in the logged-in page, waits for its content, scrolls the page's internal route container to load all available cards, and excludes recommendation/footer videos from the result.
+
+When a dynamic page returns a `## Media` section, use `fetch_media` for image inspection and pass the source page URL. It reuses that page's logged-in Ego Browser context, works across CDN/media origins, normalizes X images to `name=orig`, saves an intermediate copy under `~/Desktop/Web-Access/pi-web-access/<session>/`, and returns the original image bytes directly only when the current model advertises image input. Text-only models receive the local path so a vision bridge can process it without a shell `curl` request. Some sites, including Pixiv, may expose an image in the page while rejecting a separate binary request with HTTP 403; the tool reports that limitation instead of substituting a screenshot.
 
 ```typescript
 fetch_media({ url: "https://cdn.example.com/assets/example.jpg", sourceUrl: "https://example.com/post/123" })

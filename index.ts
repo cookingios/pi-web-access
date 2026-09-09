@@ -68,7 +68,7 @@ import { isSerpBaseAvailable } from "./serpbase.ts";
 import { isSerperAvailable } from "./serper.ts";
 import { isValyuAvailable } from "./valyu.ts";
 import { buildSearchErrorPlan, type SearchErrorDetails, type SearchErrorPlan } from "./render-search-error.ts";
-import { closeEgoBrowserSpaces, fetchMediaWithEgoBrowser } from "./ego-browser.ts";
+import { resumeEgoBrowserSpace, closeEgoBrowserSpaces, fetchDouyinFavoritesWithEgoBrowser, fetchMediaWithEgoBrowser } from "./ego-browser.ts";
 import { persistMediaToTemp } from "./media-temp.ts";
 import { findModelWithProviderRouting, loadEnabledModelPatterns, modelMatchesEnabledPatterns, splitThinkingSuffix } from "./summary-model-scope.ts";
 import {
@@ -140,7 +140,7 @@ interface WebSearchConfig {
 		enabled?: boolean;
 	};
 	tools?: Partial<Record<keyof ToolNames, { enabled?: boolean }>>;
-	commands?: Partial<Record<"websearch" | "curator" | "search" | "google-account", { enabled?: boolean }>>;
+	commands?: Partial<Record<"websearch" | "curator" | "search" | "google-account" | "web-browser-resume", { enabled?: boolean }>>;
 	toolNames?: Partial<ToolNames>;
 	shortcuts?: {
 		curate?: KeyId;
@@ -231,6 +231,7 @@ type ToolNames = {
 	sourceCheck: string;
 	fetchContent: string;
 	fetchMedia: string;
+	douyinFavorites: string;
 	getSearchContent: string;
 };
 
@@ -239,6 +240,7 @@ const DEFAULT_TOOL_NAMES: ToolNames = {
 	sourceCheck: "source_check",
 	fetchContent: "fetch_content",
 	fetchMedia: "fetch_media",
+	douyinFavorites: "douyin_favorites",
 	getSearchContent: "get_search_content",
 };
 const TOOL_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
@@ -261,7 +263,7 @@ function isToolEnabled(config: WebSearchConfig, key: keyof ToolNames): boolean {
 	return key !== "webSearch" && key !== "sourceCheck" || config.webSearch?.enabled !== false;
 }
 
-function isCommandEnabled(config: WebSearchConfig, name: "websearch" | "curator" | "search" | "google-account"): boolean {
+function isCommandEnabled(config: WebSearchConfig, name: "websearch" | "curator" | "search" | "google-account" | "web-browser-resume"): boolean {
 	return config.commands?.[name]?.enabled !== false;
 }
 
@@ -989,6 +991,7 @@ export default function (pi: ExtensionAPI) {
 	const sourceCheckEnabled = isToolEnabled(initConfig, "sourceCheck");
 	const fetchContentEnabled = isToolEnabled(initConfig, "fetchContent");
 	const fetchMediaEnabled = isToolEnabled(initConfig, "fetchMedia");
+	const douyinFavoritesEnabled = isToolEnabled(initConfig, "douyinFavorites");
 	const getSearchContentEnabled = isToolEnabled(initConfig, "getSearchContent");
 	const storedContentSources = joinToolNames([
 		...(webSearchEnabled ? [toolNames.webSearch] : []),
@@ -1664,11 +1667,34 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => handleSessionChange(ctx));
 	pi.on("session_tree", async (_event, ctx) => handleSessionChange(ctx));
 
+	let browserGoalSucceeded = false;
+	pi.on("agent_start", async () => { browserGoalSucceeded = false; });
+	pi.on("agent_end", async (event) => {
+		const lastAssistant = [...event.messages].reverse().find(message => message.role === "assistant");
+		browserGoalSucceeded = lastAssistant?.role === "assistant" && lastAssistant.stopReason === "stop";
+	});
+	// agent_settled excludes automatic retry/compaction/queued continuations.
+	// Background content work has its own continuation and must retain the space.
+	pi.on("agent_settled", async (_event, ctx) => {
+		if (!browserGoalSucceeded || pendingFetches.size > 0) return;
+		try { await closeEgoBrowserSpaces(ctx.sessionManager.getSessionId()); }
+		catch (error) { ctx.ui.notify(`Browser space retained: ${error instanceof Error ? error.message : String(error)}`, "warning"); }
+	});
+
+	if (isCommandEnabled(initConfig, "web-browser-resume")) pi.registerCommand("web-browser-resume", {
+		description: "Explicitly resume the retained Ego Browser space after resolving a browser stop",
+		handler: async (_args, ctx) => {
+			try {
+				const spaceId = await resumeEgoBrowserSpace(ctx.sessionManager.getSessionId());
+				ctx.ui.notify(`Resumed Ego Browser space ${spaceId}. Retry the requested operation.`, "info");
+			} catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); }
+		},
+	});
+
 	pi.on("session_shutdown", async () => {
 		sessionActive = false;
 		activeSessionId = undefined;
 		abortPendingFetches();
-		await closeEgoBrowserSpaces();
 		closeCurator();
 		clearCloneCache();
 		clearResults();
@@ -2349,9 +2375,9 @@ export default function (pi: ExtensionAPI) {
 	if (fetchContentEnabled) pi.registerTool({
 		name: toolNames.fetchContent,
 		label: "Fetch Content",
-        description: `Fetch URL(s) and extract readable content as markdown. Dynamic or login-aware sites such as X, Pixiv, Instagram, Feishu, Weibo, Reddit, Xiaohongshu, Xueqiu, and Knowledge Planet articles use an isolated Ego Browser Space before static fetch fallbacks. Use mode "raw" for exact textual HTTP response bodies or mode "answer" with prompt to answer using only fetched content. Direct image URLs return resized image content. Use mediaMode "inline" when the user needs to inspect images attached to a dynamic page; it attempts to retrieve image bytes through the browser session instead of opening the image and taking a screenshot. Use fetch_media for an explicit follow-up or retry. Supports YouTube transcripts, GitHub repositories, PDFs, and local videos. ${fetchContentStorageNote}`,
+		description: `Fetch URL(s) and extract readable content as markdown. Dynamic or login-aware sites such as X, Pixiv, Instagram, Feishu, Weibo, Reddit, Xiaohongshu, Xueqiu, Douyin, and Knowledge Planet articles use an isolated Ego Browser Space through the Ego Lite v2 API. Browser stops require user action and must not be bypassed with another fetch route. Douyin video links use the logged-in browser session to retrieve the requested muxed video+audio MP4 and independent audio track; Douyin fetching is resource-only and does not invoke a content-analysis provider. Use mode "raw" for exact textual HTTP response bodies or mode "answer" with prompt to answer using only fetched content. Direct image URLs return resized image content. Use mediaMode "inline" when the user needs to inspect images attached to a dynamic page; it attempts to retrieve image bytes through the browser session instead of opening the image and taking a screenshot. Use fetch_media for an explicit follow-up or retry. Supports YouTube transcripts, GitHub repositories, PDFs, Douyin videos, and local videos. ${fetchContentStorageNote}`,
 		promptSnippet:
-			"Use for a known URL. Dynamic/login-aware pages use an isolated Ego Browser Space; do not switch to keyword search just because direct fetching is blocked. When the user needs to inspect an attachment, set mediaMode to inline or call fetch_media on the returned Media URL; do not use a screenshot as the original file.",
+			"Use for a known URL. Dynamic/login-aware pages use an isolated Ego Browser Space; do not switch to keyword search just because direct fetching is blocked. When the user needs to inspect an attachment, set mediaMode to inline or call fetch_media on the returned Media URL; do not use a screenshot as the original file. If browser work stops, wait for the user to resolve it and explicitly run /web-browser-resume; do not retry or switch routes automatically.",
 		parameters: Type.Object({
 			url: Type.Optional(Type.String({ description: "Single URL to fetch" })),
 			urls: Type.Optional(Type.Array(Type.String(), { description: "Multiple URLs (parallel)" })),
@@ -2739,10 +2765,91 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	if (douyinFavoritesEnabled) pi.registerTool({
+		name: toolNames.douyinFavorites,
+		label: "Douyin Favorites",
+		description: "Read the logged-in Ego Browser account's Douyin favorite folder, filter videos by creator, and download the selected videos' muxed video+audio MP4 and independent audio track into the organized archive under ~/Desktop/Web-Access/pi-web-access/douyin/.",
+		promptSnippet: "Use for videos saved in a Douyin favorite folder. Default folder is 美食; pass the exact folder name such as spa or 公园, and optionally creator such as 香港健叔 or Uncle K HK. Douyin may keep the top URL unchanged while switching folders; this tool selects the folder in the logged-in page. This requires the user's existing Douyin login in Ego Browser.",
+		parameters: Type.Object({
+			folder: Type.Optional(Type.String({ description: "Douyin favorite folder name. Defaults to 美食." })),
+			creator: Type.Optional(Type.String({ description: "Optional creator filter, matched against the saved video's creator/title. Example: 香港健叔 or Uncle K HK." })),
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 12, description: "Maximum number of matching videos to download. Defaults to 5." })),
+		}),
+
+		async execute(_toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<Record<string, unknown>>> {
+			const folder = typeof params.folder === "string" && params.folder.trim() ? params.folder.trim() : "美食";
+			const creator = typeof params.creator === "string" && params.creator.trim() ? params.creator.trim() : undefined;
+			const limit = typeof params.limit === "number" && Number.isInteger(params.limit) ? Math.min(12, Math.max(1, params.limit)) : 5;
+			const sessionId = ctx?.sessionManager?.getSessionId?.();
+
+			onUpdate?.({
+				content: [{ type: "text", text: `Reading Douyin favorite folder ${folder}${creator ? ` for ${creator}` : ""}...` }],
+				details: { phase: "favorites", progress: 0 },
+			});
+			let listing;
+			try {
+				listing = await fetchDouyinFavoritesWithEgoBrowser({
+					folder,
+					...(creator ? { creator } : {}),
+					limit,
+					...(sessionId ? { sessionId } : {}),
+					signal,
+				});
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return { content: [{ type: "text", text: `Douyin favorite folder read failed: ${message}` }], details: { error: message, folder, creator } };
+			}
+
+			if (listing.items.length === 0) {
+				const filterText = creator ? ` matching creator ${creator}` : "";
+				const text = `No videos found in Douyin favorite folder ${folder}${filterText}. The folder was found and ${listing.totalVisible} saved video card(s) were scanned.`;
+				return { content: [{ type: "text", text }], details: { folder, creator, totalVisible: listing.totalVisible, matched: listing.matched, itemCount: 0 } };
+			}
+
+			onUpdate?.({
+				content: [{ type: "text", text: `Found ${listing.matched} matching Douyin video(s); downloading ${listing.items.length} resource set(s)...` }],
+				details: { phase: "video-download", progress: 0.2, itemCount: listing.items.length },
+			});
+			const results = await fetchAllContent(
+				listing.items.map((item) => item.url),
+				signal,
+				{
+					...(sessionId ? { sessionId } : {}),
+				},
+			);
+			const sections = results.map((result, index) => {
+				const item = listing.items[index];
+				return `### ${item?.author || "未知作者"}：${item?.title || result.title || item?.url}\n链接：${item?.url || result.url}\n\n${result.error ? `错误：${result.error}` : result.content}`;
+			});
+			const successful = results.filter((result) => !result.error).length;
+			return {
+				content: [{ type: "text", text: `## 抖音收藏夹视频资源\n\n收藏夹：${folder}${creator ? `\n筛选作者：${creator}` : ""}\n扫描视频：${listing.totalVisible}\n命中视频：${listing.matched}\n本次下载：${listing.items.length}\n成功：${successful}\n\n${sections.join("\n\n")}` }],
+				details: {
+					folder,
+					creator,
+					totalVisible: listing.totalVisible,
+					matched: listing.matched,
+					itemCount: listing.items.length,
+					successful,
+					urls: listing.items.map((item) => item.url),
+				},
+			};
+		},
+
+		renderResult(result, { expanded }, theme) {
+			const details = result.details as { folder?: string; matched?: number; itemCount?: number; successful?: number; error?: string };
+			if (details?.error) return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
+			const status = `${details?.successful ?? 0}/${details?.itemCount ?? 0} video resources downloaded`;
+			if (!expanded) return new Text(theme.fg("success", `${details?.folder || "Douyin favorites"}: ${status}`), 0, 0);
+			const text = result.content.find((item) => item.type === "text")?.text || "";
+			return new Text(theme.fg("success", status) + (text ? `\n${theme.fg("dim", text.slice(0, 2000))}` : ""), 0, 0);
+		},
+	});
+
 	if (fetchMediaEnabled) pi.registerTool({
 		name: toolNames.fetchMedia,
 		label: "Fetch Media",
-		description: "Retrieve image bytes from media URLs exposed by fetch_content, using the same authenticated Ego Browser Space as the source page. Saves a local intermediate copy under ~/Desktop/Temp/pi-web-access/<session>/ and returns an image block only to models that advertise image input; text-only models receive the local path for vision-bridge processing. Pass sourceUrl for media hosted on a CDN or a different origin.",
+		description: "Retrieve image bytes from media URLs exposed by fetch_content, using the same authenticated Ego Browser Space as the source page. Saves a local intermediate copy under ~/Desktop/Web-Access/pi-web-access/<session>/ and returns an image block only to models that advertise image input; text-only models receive the local path for vision-bridge processing. Pass sourceUrl for media hosted on a CDN or a different origin.",
 		promptSnippet: "Use after fetch_content returns a Media URL when the user wants to inspect or preserve the actual image. Pass the Media item's source page as sourceUrl, especially when the asset is on a CDN. Prefer this over opening the image in a tab, taking a screenshot, or using shell curl.",
 		parameters: Type.Object({
 			url: Type.Optional(Type.String({ description: "One image URL from fetch_content's Media section" })),

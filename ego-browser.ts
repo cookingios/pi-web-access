@@ -1,7 +1,17 @@
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { mkdir, rename, rm } from "node:fs/promises";
+import { join, relative } from "node:path";
 import { getWebSearchConfigPath } from "./utils.ts";
 import { loadFetchContentDomainPolicy, loadSsrfConfig, validateRemoteUrl } from "./ssrf-protection.ts";
+import {
+	cleanupStaleDouyinRuns,
+	findDouyinArtifact,
+	getDouyinArtifactDirectory,
+	getDouyinArtifactPaths,
+	getDouyinRunDirectory,
+} from "./media-temp.ts";
 
 const WEB_SEARCH_CONFIG_PATH = getWebSearchConfigPath();
 const RESULT_PREFIX = "__PI_WEB_ACCESS_EGO_RESULT__";
@@ -24,6 +34,7 @@ const DEFAULT_DOMAINS = [
 	"xiaohongshu.com",
 	"xueqiu.com",
 	"articles.zsxq.com",
+	"douyin.com",
 ];
 const DEFAULT_MEDIA_DOMAINS = [
 	"pbs.twimg.com",
@@ -37,6 +48,8 @@ const DEFAULT_MEDIA_DOMAINS = [
 	"sinaimg.cn",
 	"weibocdn.com",
 	"article-images.zsxq.com",
+	"douyinvod.com",
+	"douyinpic.com",
 ];
 
 export interface EgoBrowserConfig {
@@ -79,8 +92,58 @@ export interface EgoBrowserFetchResult {
 	spaceName: string;
 }
 
+export interface DouyinFavoriteItem {
+	url: string;
+	title: string;
+	author: string;
+}
+
+export interface DouyinFavoritesResult {
+	taskSpaceId?: string | number;
+	folder: string;
+	creator?: string;
+	totalVisible: number;
+	matched: number;
+	items: DouyinFavoriteItem[];
+}
+
+export interface DouyinVideoResult {
+	taskSpaceId?: string | number;
+	url: string;
+	title: string;
+	author?: string;
+	publishedAt?: string;
+	caption?: string;
+	collectionName?: string;
+	collectionId?: string;
+	collectionUrl?: string;
+	text: string;
+	description: string;
+	duration?: number;
+	videoPath: string;
+	audioPath?: string;
+	videoBytes: number;
+	audioBytes?: number;
+}
+
 const spaceLocks = new Map<string, Promise<void>>();
-const activeSpaces = new Set<string>();
+interface BrowserGoal {
+	name: string;
+	sessionKey: string;
+	spaceId?: number;
+	pageLabel: string;
+	stopped?: string;
+	finishAttempted?: boolean;
+}
+const activeSpaces = new Map<string, BrowserGoal>();
+const SPACE_PREFIX = "__PI_WEB_ACCESS_EGO_SPACE__";
+
+export class EgoBrowserStoppedError extends Error {
+	constructor(message: string) { super(message); this.name = "EgoBrowserStoppedError"; }
+}
+export function isEgoBrowserStoppedError(error: unknown): boolean {
+	return error instanceof EgoBrowserStoppedError;
+}
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -223,23 +286,42 @@ function safePart(value: string): string {
 	return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50) || "page";
 }
 
-function buildSpaceName(url: string, config: EgoBrowserConfig, sessionId?: string): string {
-	const parsed = new URL(url);
-	const sessionPart = sessionId ? safePart(sessionId.slice(0, 24)) : "session";
-	return `${config.spacePrefix}-${sessionPart}-${safePart(parsed.hostname)}`;
+function buildSpaceName(_url: string, config: EgoBrowserConfig, sessionId?: string): string {
+	const sessionKey = sessionId || "session";
+	const existing = [...activeSpaces.values()].find(goal => goal.sessionKey === sessionKey);
+	if (existing) return existing.name;
+	const name = `${config.spacePrefix}-${safePart(sessionKey)}-${randomUUID().slice(0, 8)}`;
+	activeSpaces.set(name, { name, sessionKey, pageLabel: "p1" });
+	return name;
+}
+
+function browserPrelude(spaceName: string): string {
+	const goal = activeSpaces.get(spaceName);
+	return `
+const task = await taskSpace(${JSON.stringify(goal?.spaceId ?? spaceName)})
+console.log(${JSON.stringify(SPACE_PREFIX)} + JSON.stringify({ spaceId: task.spaceId, pageLabel: ${JSON.stringify(goal?.pageLabel || "p1")} }))
+const browserPage = task.page(${JSON.stringify(goal?.pageLabel || "p1")})
+const checkDialog = async () => {
+ const info = await browserPage.info()
+ if (info?.dialog) {
+  await task.handOff()
+  throw new Error("Browser dialog requires user action; handle it then run /web-browser-resume")
+ }
+ return info
+}
+await checkDialog()
+`;
 }
 
 function buildScript(url: string, spaceName: string, timeoutMs: number): string {
-	const timeoutSeconds = Math.max(5, Math.ceil(timeoutMs / 1000));
 	return `
-const task = await useOrCreateTaskSpace(${JSON.stringify(spaceName)})
-await openOrReuseTab(${JSON.stringify(url)}, { wait: true, timeout: ${timeoutSeconds} })
-await wait(3)
-const info = await pageInfo()
-const snapshot = await snapshotText()
+${browserPrelude(spaceName)}
+await browserPage.goto(${JSON.stringify(url)}, { waitUntil: "domcontentloaded", timeout: ${timeoutMs} })
+await browserPage.waitForFunction(() => Boolean(document.body?.innerText?.trim()), undefined, { timeout: ${timeoutMs} })
+const info = await checkDialog()
 let dom = {}
 try {
-  dom = await js(String.raw\`(() => {
+  dom = await browserPage.evaluate(String.raw\`(() => {
     const hostname = location.hostname.toLowerCase()
     const isX = hostname === 'x.com' || hostname.endsWith('.x.com') || hostname === 'twitter.com' || hostname.endsWith('.twitter.com')
     const isPixiv = hostname === 'pixiv.net' || hostname.endsWith('.pixiv.net')
@@ -248,6 +330,7 @@ try {
     const isXueqiu = hostname === 'xueqiu.com' || hostname.endsWith('.xueqiu.com')
     const isWeibo = hostname === 'weibo.com' || hostname.endsWith('.weibo.com')
     const isZsxq = hostname === 'articles.zsxq.com'
+    const isDouyin = hostname === 'douyin.com' || hostname.endsWith('.douyin.com')
     const xueqiuArticle = isXueqiu
       ? document.querySelector('article.article__bd, .article__bd')
       : null
@@ -332,6 +415,12 @@ try {
       const candidates = [...scope.querySelectorAll('video, video source')]
         .map((el) => el.currentSrc || el.src)
         .filter(Boolean)
+      if (isDouyin) {
+        const networkVideos = performance.getEntriesByType('resource')
+          .map((entry) => entry.name)
+          .filter((src) => hostMatchesUrl(src, 'douyinvod.com') && src.includes('media-video'))
+        return unique([...candidates, ...networkVideos])
+      }
       if (isXiaohongshu) return unique(candidates.filter((src) => hostMatchesUrl(src, 'xhscdn.com')))
       if (isReddit) return unique(candidates.filter((src) => hostMatchesUrl(src, 'redd.it') || hostMatchesUrl(src, 'redditmedia.com')))
       if (isXueqiu) return unique(candidates.filter((src) => hostMatchesUrl(src, 'imedao.com')))
@@ -353,10 +442,11 @@ try {
     }
   })()\`)
 } catch (error) {
-  dom = { error: String(error) }
+  throw error
 }
-cliLog(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({
-  taskSpaceId: task.id,
+const snapshot = dom?.text?.trim() ? "" : await browserPage.snapshot({ scope: "full_page" })
+console.log(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({
+  taskSpaceId: task.spaceId,
   url: info?.url || ${JSON.stringify(url)},
   title: info?.title || '',
   snapshot: typeof snapshot === 'string' ? snapshot : '',
@@ -369,13 +459,201 @@ cliLog(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({
 `;
 }
 
-function buildMediaScript(url: string, spaceName: string, timeoutMs: number, maxBytes: number, sourceUrl?: string): string {
-	const timeoutSeconds = Math.max(5, Math.ceil(timeoutMs / 1000));
+function buildDouyinFavoritesScript(
+	folder: string,
+	creator: string | undefined,
+	spaceName: string,
+	timeoutMs: number,
+	limit: number,
+): string {
+
+	const creatorFilter = creator?.trim() || null;
 	return `
-const task = await useOrCreateTaskSpace(${JSON.stringify(spaceName)})
-${sourceUrl ? `await openOrReuseTab(${JSON.stringify(sourceUrl)}, { wait: true, timeout: ${timeoutSeconds} })` : ""}
-await openOrReuseTab(${JSON.stringify(url)}, { wait: true, timeout: ${timeoutSeconds} })
-const result = await js(String.raw\`(async () => {
+${browserPrelude(spaceName)}
+await browserPage.goto('https://www.douyin.com/user/self?showSubTab=favorite_folder&showTab=favorite_collection', { waitUntil: "domcontentloaded", timeout: ${timeoutMs} })
+await browserPage.waitForFunction(() => Boolean(document.body?.innerText?.trim()), undefined, { timeout: ${timeoutMs} })
+const selection = await browserPage.evaluate(String.raw\`(() => {
+  const wanted = ${JSON.stringify(folder)}
+  const visible = (el) => { const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0 }
+  const folderCard = [...document.querySelectorAll('[data-tip]')]
+    .find((el) => el.getAttribute('data-tip') === wanted && visible(el))
+  const candidates = [...document.querySelectorAll('p,button,span,div')]
+    .filter((el) => el.children.length === 0 && (el.textContent || '').trim() === wanted && visible(el))
+  const el = folderCard?.querySelector('p') || candidates.find((item) => item.tagName === 'P') || candidates[0]
+  if (!el) return { found: false }
+  el.click()
+  return { found: true, tag: el.tagName, className: typeof el.className === 'string' ? el.className : '', cardClassName: folderCard?.className || '' }
+})()\`)
+await checkDialog()
+if (!selection?.found) {
+  console.log(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({ taskSpaceId: task.spaceId, error: 'Could not find Douyin favorite folder: ' + ${JSON.stringify(folder)} }))
+} else {
+  const collectionStateScript = String.raw\`(() => {
+    const wanted = ${JSON.stringify(folder)}
+    const visible = (el) => { const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0 }
+    const folderCard = [...document.querySelectorAll('[data-tip]')]
+      .find((el) => el.getAttribute('data-tip') === wanted && visible(el))
+    let scope = folderCard || document.body
+    while (scope && scope !== document.body) {
+      const hasList = [...scope.querySelectorAll('ul')].some((list) => [...list.children].some((child) => child.querySelector('a[href*="/video/"]')))
+      if (hasList) break
+      scope = scope.parentElement
+    }
+    const lists = [...scope.querySelectorAll('ul')].map((list) => {
+      const anchors = [...list.children].flatMap((child) => [...child.querySelectorAll('a[href*="/video/"]')])
+      return { list, count: anchors.length }
+    }).filter((entry) => entry.count > 0).sort((a, b) => b.count - a.count)
+    const list = lists[0]?.list || null
+    const route = [...document.querySelectorAll('.route-scroll-container')]
+      .find((el) => el.contains(folderCard) || (list && el.contains(list)))
+    if (route) {
+      const step = Math.max(500, route.clientHeight - 100)
+      route.scrollTop = Math.min(route.scrollHeight, route.scrollTop + step)
+      route.dispatchEvent(new Event('scroll', { bubbles: true }))
+    }
+    const scopeText = scope?.innerText || ''
+    return {
+      count: list ? list.querySelectorAll('a[href*="/video/"]').length : 0,
+      empty: !list && /暂无内容|没有内容|还没有收藏/.test(scopeText),
+      atBottom: !route || route.scrollTop + route.clientHeight >= route.scrollHeight - 8,
+    }
+  })()\`
+  let previousCount = -1
+  let stableSteps = 0
+  for (let i = 0; i < 30; i++) {
+    const state = await browserPage.evaluate(collectionStateScript)
+    if (state?.empty) break
+    if (state?.count === previousCount && state?.atBottom) stableSteps++
+    else stableSteps = 0
+    previousCount = state?.count ?? previousCount
+    if ((state?.count || 0) > 0 && stableSteps >= 3) break
+    await browserPage.waitForTimeout(1500)
+  }
+  const result = await browserPage.evaluate(String.raw\`(() => {
+    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim()
+    const creator = ${JSON.stringify(creatorFilter)}
+    const wanted = ${JSON.stringify(folder)}
+    const folderCard = [...document.querySelectorAll('[data-tip]')]
+      .find((el) => el.getAttribute('data-tip') === wanted)
+    let scope = folderCard || document.body
+    while (scope && scope !== document.body) {
+      const hasList = [...scope.querySelectorAll('ul')].some((list) => [...list.children].some((child) => child.querySelector('a[href*="/video/"]')))
+      if (hasList) break
+      scope = scope.parentElement
+    }
+    const list = [...scope.querySelectorAll('ul')].map((candidate) => {
+      const anchors = [...candidate.children].flatMap((child) => [...child.querySelectorAll('a[href*="/video/"]')])
+      return { candidate, count: anchors.length }
+    }).filter((entry) => entry.count > 0).sort((a, b) => b.count - a.count)[0]?.candidate
+    const rows = (list ? [...list.querySelectorAll('a[href*="/video/"]')] : []).map((anchor) => {
+      let url = ''
+      try {
+        const parsed = new URL(anchor.href, location.href)
+        parsed.search = ''
+        parsed.hash = ''
+        url = parsed.toString()
+      } catch {}
+      const image = anchor.querySelector('img[alt]')
+      const alt = normalize(image?.alt || '')
+      const match = alt.match(/^([^：:]{1,120})[：:]\\s*(.*)$/)
+      const author = normalize(match?.[1] || '')
+      const title = normalize(match?.[2] || anchor.innerText || alt)
+      return { url, title, author, searchable: normalize([author, title, alt].join(' ')).toLowerCase() }
+    }).filter((item) => item.url && item.title)
+    const unique = []
+    const seen = new Set()
+    for (const item of rows) {
+      if (seen.has(item.url)) continue
+      seen.add(item.url)
+      if (creator && !item.searchable.includes(creator.toLowerCase())) continue
+      unique.push({ url: item.url, title: item.title, author: item.author })
+    }
+    return { totalVisible: rows.length, matched: unique.length, items: unique.slice(0, ${limit}) }
+  })()\`)
+  console.log(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({ taskSpaceId: task.spaceId, folder: ${JSON.stringify(folder)}, creator: ${JSON.stringify(creatorFilter)}, selection, ...result }))
+}
+`;
+}
+
+export function buildDouyinVideoScript(url: string, spaceName: string, timeoutMs: number, outputDir: string): string {
+	return [
+		"const { mkdir, writeFile } = await import('node:fs/promises')",
+		"const { join } = await import('node:path')",
+		browserPrelude(spaceName),
+		"const bounded = async (promise, limitMs, label) => { let timer; try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(label + ' timed out')), limitMs) })]) } finally { clearTimeout(timer) } }",
+		'await browserPage.goto(' + JSON.stringify(url) + ', { waitUntil: "domcontentloaded", timeout: ' + timeoutMs + ' })',
+		"await mkdir(" + JSON.stringify(outputDir) + ", { recursive: true })",
+		"const errors = []",
+		"const deadline = Date.now() + " + String(timeoutMs),
+		"const mediaDeadline = Date.now() + 15000",
+		"const pageScript = String.raw`(() => {",
+		"  const resources = performance.getEntriesByType('resource').map((entry) => entry.name)",
+		"  const video = [...document.querySelectorAll('video')].find((item) => item.readyState > 0 || item.src)",
+		"  const currentTitle = document.title || ''",
+		"  const title = currentTitle.endsWith(' - 抖音') ? currentTitle.slice(0, -5).trim() : currentTitle.trim()",
+		"  const description = document.querySelector('meta[name=description]')?.content || ''",
+		"  const bodyText = document.body?.innerText || ''",
+		"  const authorMatch = description.match(/-\\s*(.+?)于\\d{8}发布在抖音/)",
+		"  const publishedMatch = bodyText.match(/(?:^|\\n)发布时间[:：]\\s*(\\d{4}[-/]\\d{1,2}[-/]\\d{1,2}(?:\\s+\\d{1,2}:\\d{2})?)/)",
+		"  const collectionLink = [...document.querySelectorAll('a[href*=\"/collection/\"]')].map((item) => ({ name: (item.innerText || item.textContent || '').trim(), url: item.href })).find((item) => item.name)",
+		"  const collectionMatch = bodyText.match(/(?:^|\\n)合集\\s*[·•]\\s*([^\\n]+)/)",
+		"  const collectionName = collectionMatch?.[1]?.trim() || collectionLink?.name || ''",
+		"  const collectionUrl = collectionLink?.url || ''",
+		"  const collectionId = collectionUrl.match(/\\/collection\\/(\\d+)/)?.[1] || ''",
+		"  const findMedia = (part) => resources.filter((item) => item.includes('douyinvod.com') && item.includes(part)).at(-1) || ''",
+		"  const directUrl = /^https?:\\/\\//.test(video?.currentSrc || video?.src || '') ? (video.currentSrc || video.src) : ''",
+		"  return { title, author: authorMatch?.[1]?.trim() || '', publishedAt: publishedMatch?.[1] || '', caption: title, collectionName, collectionId, collectionUrl, description, text: bodyText, duration: Number.isFinite(video?.duration) ? video.duration : undefined, userAgent: navigator.userAgent, referrer: location.href, videoUrl: findMedia('media-video') || directUrl, audioUrl: findMedia('media-audio') }",
+		"})()`",
+		"let metadata = {}",
+		"let videoUrl = ''",
+		"let audioUrl = ''",
+		"while (Date.now() < deadline && (!videoUrl || (!audioUrl && Date.now() < mediaDeadline))) {",
+		"  {",
+		"    await checkDialog()",
+		"    const fresh = await browserPage.evaluate(pageScript)",
+		"    if (fresh?.title || fresh?.description || fresh?.text || fresh?.duration) metadata = { ...metadata, ...fresh }",
+		"    if (fresh?.videoUrl) videoUrl = fresh.videoUrl",
+		"    if (fresh?.audioUrl) audioUrl = fresh.audioUrl",
+		"  }",
+		"  if (videoUrl && audioUrl) break",
+		"  await browserPage.waitForTimeout(500)",
+		"}",
+		"const resultBase = { taskSpaceId: task.spaceId, url: " + JSON.stringify(url) + ", title: metadata.title || '', author: metadata.author || '', publishedAt: metadata.publishedAt || '', caption: metadata.caption || metadata.title || '', collectionName: metadata.collectionName || '', collectionId: metadata.collectionId || '', collectionUrl: metadata.collectionUrl || '', description: metadata.description || '', text: metadata.text || '', duration: metadata.duration, videoPath: undefined, audioPath: undefined, videoBytes: 0, audioBytes: undefined, errors }",
+		"const downloadTrack = async (kind, resourceUrl, filename, headers) => {",
+		"  let response",
+		"  try { response = await bounded(fetch(resourceUrl, { headers: { ...headers, Range: 'bytes=0-', Accept: '*/*' } }), 15000, 'Douyin ' + kind + ' request') } catch { throw new Error('network request failed') }",
+		"  if (!response.ok && response.status !== 206) throw new Error('HTTP ' + response.status)",
+		"  let body",
+		"  try { body = Buffer.from(await bounded(response.arrayBuffer(), 60000, 'Douyin ' + kind + ' body')) } catch { throw new Error('response body read failed') }",
+		"  const rawRange = String(response.headers.get('content-range') || '').replace('bytes ', '')",
+		"  const slash = rawRange.split('/')",
+		"  const bounds = slash[0]?.split('-') || []",
+		"  const total = bounds.length === 2 && slash.length === 2 ? Number(slash[1]) : Number(response.headers.get('content-length') || 0)",
+		"  if (!Number.isFinite(total) || total <= 0 || total > 50 * 1024 * 1024 || body.length < total) throw new Error('incomplete or oversized response')",
+		"  const path = join(" + JSON.stringify(outputDir) + ", filename)",
+		"  await writeFile(path, body.subarray(0, total), { mode: 0o600 })",
+		"  return { path, bytes: total }",
+		"}",
+		"if (!videoUrl) {",
+		"  console.log(" + JSON.stringify(RESULT_PREFIX) + " + JSON.stringify({ ...resultBase, error: 'Could not find a playable Douyin video resource in the logged-in page' }))",
+		"} else {",
+		"  const headers = { 'User-Agent': metadata.userAgent || '', Referer: metadata.referrer || " + JSON.stringify(url) + " }",
+		"  let videoFile = null",
+		"  let audioFile = null",
+		"  try { videoFile = await downloadTrack('video', videoUrl, 'video-source.mp4', headers) } catch (error) { errors.push('Could not download Douyin video: ' + error.message) }",
+		"  if (audioUrl) { try { audioFile = await downloadTrack('audio', audioUrl, 'audio-source.m4a', headers) } catch (error) { errors.push('Could not download Douyin audio: ' + error.message) } }",
+		"  const page = { ...resultBase, videoPath: videoFile?.path, audioPath: audioFile?.path, videoBytes: videoFile?.bytes || 0, audioBytes: audioFile?.bytes }",
+		"  console.log(" + JSON.stringify(RESULT_PREFIX) + " + JSON.stringify(videoFile ? page : { ...page, error: errors.join(' / ') || 'Could not download a complete Douyin video resource' }))",
+		"}",
+	].join('\n')
+}
+
+function buildMediaScript(url: string, spaceName: string, timeoutMs: number, maxBytes: number, sourceUrl?: string): string {
+	return `
+${browserPrelude(spaceName)}
+${sourceUrl ? `await browserPage.goto(${JSON.stringify(sourceUrl)}, { waitUntil: "domcontentloaded", timeout: ${timeoutMs} })` : ""}
+await browserPage.goto(${JSON.stringify(url)}, { waitUntil: "domcontentloaded", timeout: ${timeoutMs} })
+const result = await browserPage.evaluate(String.raw\`(async () => {
   const target = ${JSON.stringify(normalizeMediaUrl(url))}
   const response = await fetch(target, { credentials: 'include', cache: 'force-cache' })
   if (!response.ok) throw new Error('Media request failed: HTTP ' + response.status)
@@ -392,7 +670,7 @@ const result = await js(String.raw\`(async () => {
     data: btoa(binary),
   }
 })()\`)
-cliLog(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({ taskSpaceId: task.id, ...result }))
+console.log(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({ taskSpaceId: task.spaceId, ...result }))
 `;
 }
 
@@ -403,7 +681,7 @@ function appendOutput(target: { value: string }, chunk: Buffer | string, maxByte
 	}
 }
 
-async function runEgoScript<T>(script: string, timeoutMs: number, signal?: AbortSignal, maxOutputBytes = MAX_PAGE_OUTPUT_BYTES): Promise<T> {
+async function runEgoScript<T>(script: string, timeoutMs: number, signal?: AbortSignal, maxOutputBytes = MAX_PAGE_OUTPUT_BYTES, onSpace?: (spaceId: number, pageLabel: string) => void): Promise<T> {
 	if (signal?.aborted) throw new Error("Aborted");
 	const command = process.env.PI_EGO_BROWSER_BIN || "ego-browser";
 	const child = spawn(command, ["nodejs"], {
@@ -429,12 +707,24 @@ async function runEgoScript<T>(script: string, timeoutMs: number, signal?: Abort
 
 		child.on("error", (error) => finish(error));
 		child.stdout.on("data", (chunk) => {
-			try { appendOutput(stdout, chunk, maxOutputBytes); } catch (error) { child.kill("SIGTERM"); finish(new Error(errorMessage(error))); }
+			try {
+				appendOutput(stdout, chunk, maxOutputBytes);
+				for (const line of stdout.value.split(/\r?\n/).slice(0, -1)) {
+					if (!line.startsWith(SPACE_PREFIX)) continue;
+					const state = JSON.parse(line.slice(SPACE_PREFIX.length));
+					if (Number.isInteger(state.spaceId)) onSpace?.(state.spaceId, state.pageLabel);
+				}
+			} catch (error) { child.kill("SIGTERM"); finish(new Error(errorMessage(error))); }
 		});
 		child.stderr.on("data", (chunk) => {
 			try { appendOutput(stderr, chunk, maxOutputBytes); } catch (error) { child.kill("SIGTERM"); finish(new Error(errorMessage(error))); }
 		});
 		child.on("close", (code, closeSignal) => {
+			if (signal?.aborted) { finish(new EgoBrowserStoppedError("Ego Browser operation aborted; space retained.")); return; }
+			if (code !== 0) {
+				finish(new Error(`Ego Browser failed: ${(stderr.value || stdout.value || `exit=${code}`).slice(-2000)}`));
+				return;
+			}
 			const combinedOutput = `${stdout.value}\n${stderr.value}`;
 			const markerIndex = combinedOutput.lastIndexOf(RESULT_PREFIX);
 			const line = markerIndex >= 0
@@ -462,14 +752,22 @@ async function runEgoScript<T>(script: string, timeoutMs: number, signal?: Abort
 	});
 }
 
-async function withSpaceLock<T>(spaceName: string, task: () => Promise<T>): Promise<T> {
+async function withSpaceLock<T>(spaceName: string, task: () => Promise<T>, control = false): Promise<T> {
 	const previous = spaceLocks.get(spaceName) ?? Promise.resolve();
 	let release!: () => void;
 	const current = new Promise<void>((resolve) => { release = resolve; });
 	spaceLocks.set(spaceName, current);
 	await previous;
 	try {
+		const goal = activeSpaces.get(spaceName);
+		if (!control && !goal) throw new EgoBrowserStoppedError("Browser goal already finished; retry in a new goal.");
+		if (!control && goal?.stopped) throw new EgoBrowserStoppedError(goal.stopped);
 		return await task();
+	} catch (error) {
+		const goal = activeSpaces.get(spaceName);
+		if (goal && !goal.stopped) goal.stopped = `Ego Browser stopped (space ${goal.spaceId ?? "unknown"}): ${errorMessage(error)}. Resolve the browser state, then explicitly run /web-browser-resume.`;
+		if (!control && goal?.spaceId !== undefined && !isEgoBrowserStoppedError(error)) throw new EgoBrowserStoppedError(goal.stopped!);
+		throw error;
 	} finally {
 		release();
 		if (spaceLocks.get(spaceName) === current) spaceLocks.delete(spaceName);
@@ -483,12 +781,142 @@ export async function fetchWithEgoBrowser(
 ): Promise<EgoBrowserFetchResult> {
 	const config = loadEgoBrowserConfig();
 	const spaceName = buildSpaceName(url, config, options?.sessionId);
-	activeSpaces.add(spaceName);
 	return withSpaceLock(spaceName, async () => {
-		const page = await runEgoScript<EgoBrowserPageData>(buildScript(url, spaceName, config.timeoutMs), config.timeoutMs, signal);
+		const page = await runBrowserScript<EgoBrowserPageData>(spaceName, buildScript(url, spaceName, config.timeoutMs), config.timeoutMs, signal);
 		const text = (page.text || page.snapshot || "").trim();
 		if (!text) throw new Error("Ego Browser opened the page but exposed no readable content");
 		return { page: { ...page, text }, spaceName };
+	});
+}
+
+export function isDouyinVideoURL(url: string): boolean {
+	return getDouyinVideoId(url) !== null;
+}
+
+export function getDouyinVideoId(url: string): string | null {
+	try {
+		const parsed = new URL(url);
+		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+		if (!hostMatches(parsed.hostname.toLowerCase(), "douyin.com")) return null;
+		const directMatch = parsed.pathname.match(/^\/video\/(\d+)\/?$/);
+		if (directMatch) return directMatch[1];
+		const modalId = parsed.searchParams.get("modal_id")?.trim() || "";
+		if (/^\d+$/.test(modalId)) return modalId;
+		const embeddedId = parsed.searchParams.get("vid")?.trim() || "";
+		return /^\d+$/.test(embeddedId) ? embeddedId : null;
+	} catch {
+		return null;
+	}
+}
+
+export function normalizeDouyinVideoURL(url: string): string | null {
+	const videoId = getDouyinVideoId(url);
+	return videoId ? `https://www.douyin.com/video/${videoId}` : null;
+}
+
+export async function fetchDouyinFavoritesWithEgoBrowser(
+	options: { folder?: string; creator?: string; limit?: number; sessionId?: string; signal?: AbortSignal } = {},
+): Promise<DouyinFavoritesResult> {
+	const config = loadEgoBrowserConfig();
+	if (!config.enabled) throw new Error("Ego Browser is disabled in web-search.json");
+	const folder = options.folder?.trim() || "美食";
+	const limit = Math.min(20, Math.max(1, Math.floor(options.limit ?? 5)));
+	const spaceName = buildSpaceName("https://www.douyin.com", config, options.sessionId);
+	return withSpaceLock(spaceName, async () => {
+		const result = await runBrowserScript<DouyinFavoritesResult & { error?: string }>(spaceName,
+			buildDouyinFavoritesScript(folder, options.creator, spaceName, config.timeoutMs, limit),
+			config.timeoutMs,
+			options.signal,
+		);
+		if (result.error) throw new Error(result.error);
+		return result;
+	});
+}
+
+function readCachedDouyinArtifact(paths: ReturnType<typeof getDouyinArtifactPaths>, canonicalUrl: string): DouyinVideoResult | null {
+	try {
+		const metadata = JSON.parse(readFileSync(paths.metadataPath, "utf8")) as Record<string, unknown>;
+		const collection = metadata.collection && typeof metadata.collection === "object" && !Array.isArray(metadata.collection)
+			? metadata.collection as Record<string, unknown>
+			: {};
+		const duration = typeof metadata.durationSeconds === "number" ? metadata.durationSeconds : undefined;
+		return {
+			url: typeof metadata.canonicalUrl === "string" ? metadata.canonicalUrl : canonicalUrl,
+			title: typeof metadata.title === "string" ? metadata.title : "",
+			author: typeof metadata.author === "string" ? metadata.author : undefined,
+			publishedAt: typeof metadata.publishedAt === "string" ? metadata.publishedAt : undefined,
+			caption: typeof metadata.caption === "string" ? metadata.caption : undefined,
+			collectionName: typeof collection.name === "string" ? collection.name : undefined,
+			collectionId: typeof collection.id === "string" ? collection.id : undefined,
+			collectionUrl: typeof collection.url === "string" ? collection.url : undefined,
+			text: typeof metadata.pageText === "string" ? metadata.pageText : "",
+			description: typeof metadata.description === "string" ? metadata.description : "",
+			duration,
+			videoPath: paths.videoPath,
+			audioPath: paths.audioPath,
+			videoBytes: statSync(paths.videoPath).size,
+			audioBytes: statSync(paths.audioPath).size,
+		};
+	} catch {
+		return null;
+	}
+}
+
+function remapDouyinArtifactPaths(result: DouyinVideoResult, sourceDirectory: string, targetDirectory: string): DouyinVideoResult {
+		const remap = (path: string): string => {
+			const suffix = relative(sourceDirectory, path);
+			return suffix.startsWith("..") ? path : join(targetDirectory, suffix);
+		};
+		return {
+			...result,
+			videoPath: remap(result.videoPath),
+			...(result.audioPath ? { audioPath: remap(result.audioPath) } : {}),
+		};
+}
+
+export async function fetchDouyinVideoWithEgoBrowser(
+	url: string,
+	signal?: AbortSignal,
+	options?: { sessionId?: string },
+): Promise<DouyinVideoResult> {
+	const canonicalUrl = normalizeDouyinVideoURL(url);
+	if (!canonicalUrl) throw new Error("Not a supported Douyin video URL");
+	const config = loadEgoBrowserConfig();
+	if (!config.enabled) throw new Error("Ego Browser is disabled in web-search.json");
+	const videoId = getDouyinVideoId(canonicalUrl) || "video";
+	await cleanupStaleDouyinRuns();
+	const cachedPaths = await findDouyinArtifact(videoId);
+	const cached = cachedPaths ? readCachedDouyinArtifact(cachedPaths, canonicalUrl) : null;
+	if (cached) return cached;
+	const outputDir = getDouyinRunDirectory(options?.sessionId);
+	await mkdir(outputDir, { recursive: true, mode: 0o700 });
+	const spaceName = buildSpaceName(canonicalUrl, config, options?.sessionId);
+	const captureTimeoutMs = Math.max(config.timeoutMs, 120_000);
+	const scriptTimeoutMs = Math.max(15_000, captureTimeoutMs - 15_000);
+	return withSpaceLock(spaceName, async () => {
+		const result = await runBrowserScript<DouyinVideoResult & { error?: string }>(spaceName,
+			buildDouyinVideoScript(canonicalUrl, spaceName, scriptTimeoutMs, outputDir),
+			captureTimeoutMs,
+			signal,
+			MAX_PAGE_OUTPUT_BYTES,
+		);
+		if (result.error) throw new Error(result.error);
+		if (!result.videoPath || !existsSync(result.videoPath)) {
+			throw new Error("Douyin video resource was not downloaded");
+		}
+		const racedPaths = await findDouyinArtifact(videoId);
+		const raced = racedPaths ? readCachedDouyinArtifact(racedPaths, canonicalUrl) : null;
+		if (raced) {
+			await rm(outputDir, { recursive: true, force: true });
+			return raced;
+		}
+		const requestedDirectory = getDouyinArtifactDirectory(videoId, result.caption || result.title, result.publishedAt);
+		const outputDirectory = existsSync(requestedDirectory)
+			? `${requestedDirectory}-retry-${Date.now()}`
+			: requestedDirectory;
+		await mkdir(join(outputDirectory, ".."), { recursive: true, mode: 0o700 });
+		await rename(outputDir, outputDirectory);
+		return { ...remapDouyinArtifactPaths(result, outputDir, outputDirectory), url: canonicalUrl };
 	});
 }
 
@@ -506,8 +934,7 @@ export async function fetchMediaWithEgoBrowser(
 	const normalizedUrl = normalizeMediaUrl(url);
 	await validateBrowserMediaUrls(normalizedUrl, options?.sourceUrl);
 	const spaceName = buildSpaceName(options?.sourceUrl || normalizedUrl, config, options?.sessionId);
-	activeSpaces.add(spaceName);
-	return withSpaceLock(spaceName, async () => runEgoScript<EgoBrowserMediaData>(
+	return withSpaceLock(spaceName, async () => runBrowserScript<EgoBrowserMediaData>(spaceName,
 		buildMediaScript(normalizedUrl, spaceName, config.timeoutMs, MAX_MEDIA_BYTES, options?.sourceUrl),
 		config.timeoutMs,
 		signal,
@@ -515,19 +942,70 @@ export async function fetchMediaWithEgoBrowser(
 	));
 }
 
-export async function closeEgoBrowserSpaces(): Promise<void> {
-	const spaces = [...activeSpaces];
-	activeSpaces.clear();
-	if (spaces.length === 0) return;
-	const script = `
-for (const name of ${JSON.stringify(spaces)}) {
-  try { await completeTaskSpace(name, { keep: false }) } catch {}
-}
-cliLog(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({ closed: ${spaces.length} }))
-`;
+
+async function runBrowserScript<T>(spaceName: string, script: string, timeoutMs: number, signal?: AbortSignal, maxOutputBytes = MAX_PAGE_OUTPUT_BYTES): Promise<T> {
+	const goal = activeSpaces.get(spaceName);
 	try {
-		await runEgoScript(script, 15_000);
-	} catch {
-		// Session shutdown must not fail just because the browser is unavailable.
+		const result = await runEgoScript<T & { browserError?: string; error?: string }>(`
+try {
+${script}
+} catch (error) {
+ console.log(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({ browserError: String(error?.message || error), code: error?.code, executionStopped: error?.executionStopped, mayHaveLateEffects: error?.mayHaveLateEffects }))
+}
+`, timeoutMs, signal, maxOutputBytes, (spaceId, pageLabel) => {
+			if (goal) { goal.spaceId = spaceId; goal.pageLabel = pageLabel; }
+		});
+		if (result.browserError) throw new EgoBrowserStoppedError(result.browserError);
+		if (result.error) throw new Error(result.error);
+		return result;
+	} catch (error) {
+		// Once a space exists, never route around a stopped/failed browser round.
+		if (goal?.spaceId !== undefined || isEgoBrowserStoppedError(error)) {
+			throw new EgoBrowserStoppedError(`Space ${goal?.spaceId ?? "unknown"}: ${errorMessage(error)}. Browser work stopped; resolve the browser state, then explicitly run /web-browser-resume.`);
+		}
+		throw error;
 	}
+}
+
+/** Called only at the successful goal boundary, never as error/shutdown cleanup. */
+export async function closeEgoBrowserSpaces(sessionId?: string): Promise<void> {
+	const goals = [...activeSpaces.values()].filter(goal => sessionId === undefined || goal.sessionKey === sessionId);
+	for (const goal of goals) {
+		await withSpaceLock(goal.name, async () => {
+			if (goal.stopped || goal.finishAttempted || goal.spaceId === undefined) return;
+			goal.finishAttempted = true;
+			const receipt = await runEgoScript<{ finished: boolean }>(`
+const task = await taskSpace(${goal.spaceId})
+await task.finish({ keep: [] })
+console.log(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({ finished: true }))
+`, 15_000);
+			if (!receipt.finished) throw new Error("Ego Browser did not confirm finish");
+			activeSpaces.delete(goal.name);
+		}, true);
+	}
+}
+
+/** Only an explicit user command may authorize takeover; never called by a tool retry. */
+export async function resumeEgoBrowserSpace(sessionId?: string): Promise<number> {
+	const goal = [...activeSpaces.values()].find(item => item.sessionKey === (sessionId || "session"));
+	if (!goal || goal.spaceId === undefined) throw new Error("No recorded browser space to resume. Inspect Ego Lite manually; no new space was created.");
+	if (goal.finishAttempted) throw new Error("Finish was already attempted. Inspect the retained space manually; it will not be finished twice.");
+	return withSpaceLock(goal.name, async () => {
+		if (activeSpaces.get(goal.name) !== goal || goal.finishAttempted) throw new Error("Browser goal already finished or finish was attempted; inspect it manually.");
+		const result = await runEgoScript<{ spaceId: number; pageLabel: string }>(`
+const spaces = await listTaskSpaces()
+const existing = spaces.find(space => space.id === ${goal.spaceId})
+if (!existing) throw new Error("Recorded space no longer exists; no replacement was created")
+const task = existing.ownership === "agent"
+ ? await takeOverTaskSpace(${goal.spaceId})
+ : await claimTaskSpace(${goal.spaceId})
+let page = task.userPage() || task.page(${JSON.stringify(goal.pageLabel)})
+if (!page.label) page = await task.adopt(page)
+console.log(${JSON.stringify(RESULT_PREFIX)} + JSON.stringify({ spaceId: task.spaceId, pageLabel: page.label }))
+`, 15_000);
+		if (result.spaceId !== goal.spaceId || !result.pageLabel) throw new Error("Unexpected browser resume receipt");
+		goal.pageLabel = result.pageLabel;
+		goal.stopped = undefined;
+		return result.spaceId;
+	}, true);
 }
